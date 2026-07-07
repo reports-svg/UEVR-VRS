@@ -342,6 +342,25 @@ VRRuntime::Error OpenXR::update_poses(bool from_view_extensions, uint32_t frame_
         this->grip_matrices[i][3] = Vector4f{*(Vector3f*)&hand.grip_location.pose.position, 1.0f};
     }
 
+    // Eye gaze is optional - never fail the pose update over it.
+    if (this->eye_gaze.space != XR_NULL_HANDLE) {
+        XrSpaceLocation gaze_location{XR_TYPE_SPACE_LOCATION};
+        const auto gaze_result = xrLocateSpace(this->eye_gaze.space, this->view_space, display_time, &gaze_location);
+
+        constexpr XrSpaceLocationFlags wanted_gaze_flags =
+            XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
+
+        std::scoped_lock gaze_lock{this->eye_gaze.mtx};
+
+        if (gaze_result == XR_SUCCESS && (gaze_location.locationFlags & wanted_gaze_flags) == wanted_gaze_flags) {
+            const auto gaze_orientation = runtimes::OpenXR::to_glm(gaze_location.pose.orientation);
+            this->eye_gaze.direction = glm::normalize(gaze_orientation * Vector3f{0.0f, 0.0f, -1.0f});
+            this->eye_gaze.valid = true;
+        } else {
+            this->eye_gaze.valid = false;
+        }
+    }
+
     if (!this->got_first_valid_poses) {
         constexpr auto wanted_flags = XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_TRACKED_BIT | XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
         this->got_first_valid_poses = (this->view_space_location.locationFlags & wanted_flags) == wanted_flags;
@@ -687,6 +706,15 @@ void OpenXR::destroy() {
     this->system = XR_NULL_SYSTEM_ID;
     this->frame_synced = false;
     this->frame_began = false;
+
+    // Owned by the destroyed session/instance.
+    {
+        std::scoped_lock gaze_lock{this->eye_gaze.mtx};
+        this->eye_gaze.space = XR_NULL_HANDLE;
+        this->eye_gaze.action = XR_NULL_HANDLE;
+        this->eye_gaze.valid = false;
+        this->eye_gaze.binding_suggested = false;
+    }
 }
 
 OpenXR::PipelineState OpenXR::get_submit_state() {
@@ -1134,6 +1162,34 @@ std::optional<std::string> OpenXR::initialize_actions(const std::string& json_st
         }
     }
 
+    // XR_EXT_eye_gaze_interaction: create a gaze pose action + binding so
+    // foveated rendering (and anything else) can follow the user's eyes.
+    if (this->enabled_extensions.contains(XR_EXT_EYE_GAZE_INTERACTION_EXTENSION_NAME)) {
+        spdlog::info("[VR] Creating eye gaze action");
+
+        XrActionCreateInfo action_create_info{XR_TYPE_ACTION_CREATE_INFO};
+        strcpy(action_create_info.actionName, "eyegazepose");
+        strcpy(action_create_info.localizedActionName, "Eye Gaze Pose");
+        action_create_info.actionType = XR_ACTION_TYPE_POSE_INPUT;
+        action_create_info.countSubactionPaths = 0;
+        action_create_info.subactionPaths = nullptr;
+
+        if (auto result = xrCreateAction(this->action_set.handle, &action_create_info, &this->eye_gaze.action); result == XR_SUCCESS) {
+            XrPath gaze_pose_path{};
+
+            if (xrStringToPath(this->instance, "/user/eyes_ext/input/gaze_ext/pose", &gaze_pose_path) == XR_SUCCESS) {
+                this->eye_gaze.binding_suggested = attempt_add_binding(
+                    "/interaction_profiles/ext/eye_gaze_interaction",
+                    XrActionSuggestedBinding{this->eye_gaze.action, gaze_pose_path});
+            }
+
+            spdlog::info("[VR] Eye gaze binding suggested: {}", this->eye_gaze.binding_suggested);
+        } else {
+            spdlog::info("[VR] xrCreateAction for eye gaze failed (non-fatal): {}", this->get_result_string(result));
+            this->eye_gaze.action = XR_NULL_HANDLE;
+        }
+    }
+
     // Create the action spaces for each hand
     // Grip space
     for (auto i = 0; i < 2; ++i) {
@@ -1160,6 +1216,20 @@ std::optional<std::string> OpenXR::initialize_actions(const std::string& json_st
 
         if (auto result = xrCreateActionSpace(this->session, &action_space_create_info, &this->hands[i].aim_space); result != XR_SUCCESS) {
             return "xrCreateActionSpace failed (" + std::to_string(i) + ")" + this->get_result_string(result);
+        }
+    }
+
+    // Eye gaze space
+    if (this->eye_gaze.action != XR_NULL_HANDLE && this->eye_gaze.binding_suggested) {
+        spdlog::info("[VR] Creating eye gaze action space");
+
+        XrActionSpaceCreateInfo action_space_create_info{XR_TYPE_ACTION_SPACE_CREATE_INFO};
+        action_space_create_info.action = this->eye_gaze.action;
+        action_space_create_info.poseInActionSpace.orientation.w = 1.0f;
+
+        if (auto result = xrCreateActionSpace(this->session, &action_space_create_info, &this->eye_gaze.space); result != XR_SUCCESS) {
+            spdlog::info("[VR] xrCreateActionSpace for eye gaze failed (non-fatal): {}", this->get_result_string(result));
+            this->eye_gaze.space = XR_NULL_HANDLE;
         }
     }
 

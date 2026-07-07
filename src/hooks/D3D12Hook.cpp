@@ -1,18 +1,54 @@
+#include <array>
 #include <thread>
 #include <future>
 #include <unordered_set>
 
 #include <spdlog/spdlog.h>
+#include <wrl/client.h>
 #include <utility/Thread.hpp>
 #include <utility/Module.hpp>
 #include <utility/RTTI.hpp>
 
 #include "WindowFilter.hpp"
 #include "Framework.hpp"
+#include "render/VRSInjector.hpp"
 
 #include "D3D12Hook.hpp"
 
 static D3D12Hook* g_d3d12_hook = nullptr;
+
+namespace {
+// ID3D12Device vtable index for CreateRenderTargetView, and
+// ID3D12GraphicsCommandList vtable indices for RSSetViewports/OMSetRenderTargets.
+constexpr size_t CREATE_RENDER_TARGET_VIEW_VTABLE_INDEX = 20;
+constexpr size_t RS_SET_VIEWPORTS_VTABLE_INDEX = 21;
+constexpr size_t OM_SET_RENDER_TARGETS_VTABLE_INDEX = 46;
+
+template <typename TInterface>
+void add_unique_pointer_hook(
+    TInterface* iface,
+    size_t vtable_index,
+    void* detour,
+    std::vector<std::unique_ptr<PointerHook>>& storage,
+    std::unordered_map<uintptr_t, PointerHook*>& lookup,
+    std::unordered_set<uintptr_t>& seen_slots
+) {
+    if (iface == nullptr) {
+        return;
+    }
+
+    auto** slot = &(*(void***)iface)[vtable_index];
+    const auto slot_key = reinterpret_cast<uintptr_t>(slot);
+
+    if (!seen_slots.emplace(slot_key).second) {
+        return;
+    }
+
+    auto hook = std::make_unique<PointerHook>(slot, detour);
+    lookup.emplace(slot_key, hook.get());
+    storage.emplace_back(std::move(hook));
+}
+}
 
 D3D12Hook::~D3D12Hook() {
     unhook();
@@ -121,6 +157,22 @@ bool D3D12Hook::hook() {
     ID3D12CommandQueue* command_queue{ nullptr };
     if (FAILED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&command_queue)))) {
         spdlog::error("Failed to create D3D12 Dummy Command Queue");
+        return false;
+    }
+
+    // Dummy allocator + command list purely to reach the shared
+    // ID3D12GraphicsCommandList vtable for the VRS scene-pass hooks.
+    ID3D12CommandAllocator* command_allocator{ nullptr };
+    ID3D12GraphicsCommandList* command_list{ nullptr };
+
+    if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&command_allocator)))) {
+        spdlog::error("Failed to create D3D12 Dummy Command Allocator");
+        return false;
+    }
+
+    if (FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, command_allocator, nullptr, IID_PPV_ARGS(&command_list)))) {
+        spdlog::error("Failed to create D3D12 Dummy Graphics Command List");
+        command_allocator->Release();
         return false;
     }
 
@@ -337,6 +389,12 @@ bool D3D12Hook::hook() {
         spdlog::info("Initializing hooks");
         m_present_hook.reset();
         m_present1_hook.reset();
+        m_create_render_target_view_hooks.clear();
+        m_om_set_render_targets_hooks.clear();
+        m_rs_set_viewports_hooks.clear();
+        m_create_render_target_view_hook_lookup.clear();
+        m_om_set_render_targets_hook_lookup.clear();
+        m_rs_set_viewports_hook_lookup.clear();
         m_swapchain_hook.reset();
 
         m_is_phase_1 = true;
@@ -345,10 +403,122 @@ bool D3D12Hook::hook() {
         auto& present1_fn = (*(void***)target_swapchain)[22]; // Present1
         m_present_hook = std::make_unique<PointerHook>(&present_fn, (void*)&D3D12Hook::present);
         m_present1_hook = std::make_unique<PointerHook>(&present1_fn, (void*)&D3D12Hook::present1);
+
+        // VRS foveated rendering hooks: CreateRenderTargetView on every device
+        // interface revision, RSSetViewports/OMSetRenderTargets on every command
+        // list revision. COM vtables are shared per implementation, so hooking the
+        // dummy objects' vtables reaches the game's real objects; the seen-slot set
+        // dedupes interfaces that share a vtable.
+        std::unordered_set<uintptr_t> render_target_view_slots{};
+        std::unordered_set<uintptr_t> om_set_render_targets_slots{};
+        std::unordered_set<uintptr_t> rs_set_viewports_slots{};
+
+        Microsoft::WRL::ComPtr<ID3D12Device1> device1{};
+        Microsoft::WRL::ComPtr<ID3D12Device2> device2{};
+        Microsoft::WRL::ComPtr<ID3D12Device3> device3{};
+        Microsoft::WRL::ComPtr<ID3D12Device4> device4{};
+        Microsoft::WRL::ComPtr<ID3D12Device5> device5{};
+        Microsoft::WRL::ComPtr<ID3D12Device6> device6{};
+        Microsoft::WRL::ComPtr<ID3D12Device7> device7{};
+        Microsoft::WRL::ComPtr<ID3D12Device8> device8{};
+        Microsoft::WRL::ComPtr<ID3D12Device9> device9{};
+        Microsoft::WRL::ComPtr<ID3D12Device10> device10{};
+
+        device->QueryInterface(IID_PPV_ARGS(&device1));
+        device->QueryInterface(IID_PPV_ARGS(&device2));
+        device->QueryInterface(IID_PPV_ARGS(&device3));
+        device->QueryInterface(IID_PPV_ARGS(&device4));
+        device->QueryInterface(IID_PPV_ARGS(&device5));
+        device->QueryInterface(IID_PPV_ARGS(&device6));
+        device->QueryInterface(IID_PPV_ARGS(&device7));
+        device->QueryInterface(IID_PPV_ARGS(&device8));
+        device->QueryInterface(IID_PPV_ARGS(&device9));
+        device->QueryInterface(IID_PPV_ARGS(&device10));
+
+        const std::array<IUnknown*, 11> device_interfaces{
+            (IUnknown*)device,
+            device1.Get(),
+            device2.Get(),
+            device3.Get(),
+            device4.Get(),
+            device5.Get(),
+            device6.Get(),
+            device7.Get(),
+            device8.Get(),
+            device9.Get(),
+            device10.Get()
+        };
+
+        for (auto* iface : device_interfaces) {
+            add_unique_pointer_hook(
+                iface,
+                CREATE_RENDER_TARGET_VIEW_VTABLE_INDEX,
+                reinterpret_cast<void*>(&D3D12Hook::create_render_target_view),
+                m_create_render_target_view_hooks,
+                m_create_render_target_view_hook_lookup,
+                render_target_view_slots
+            );
+        }
+
+        Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList1> command_list1{};
+        Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList2> command_list2{};
+        Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList3> command_list3{};
+        Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4> command_list4{};
+        Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList5> command_list5{};
+        Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList6> command_list6{};
+        Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList7> command_list7{};
+
+        command_list->QueryInterface(IID_PPV_ARGS(&command_list1));
+        command_list->QueryInterface(IID_PPV_ARGS(&command_list2));
+        command_list->QueryInterface(IID_PPV_ARGS(&command_list3));
+        command_list->QueryInterface(IID_PPV_ARGS(&command_list4));
+        command_list->QueryInterface(IID_PPV_ARGS(&command_list5));
+        command_list->QueryInterface(IID_PPV_ARGS(&command_list6));
+        command_list->QueryInterface(IID_PPV_ARGS(&command_list7));
+
+        const std::array<IUnknown*, 8> command_list_interfaces{
+            (IUnknown*)command_list,
+            command_list1.Get(),
+            command_list2.Get(),
+            command_list3.Get(),
+            command_list4.Get(),
+            command_list5.Get(),
+            command_list6.Get(),
+            command_list7.Get()
+        };
+
+        for (auto* iface : command_list_interfaces) {
+            add_unique_pointer_hook(
+                iface,
+                OM_SET_RENDER_TARGETS_VTABLE_INDEX,
+                reinterpret_cast<void*>(&D3D12Hook::om_set_render_targets),
+                m_om_set_render_targets_hooks,
+                m_om_set_render_targets_hook_lookup,
+                om_set_render_targets_slots
+            );
+
+            add_unique_pointer_hook(
+                iface,
+                RS_SET_VIEWPORTS_VTABLE_INDEX,
+                reinterpret_cast<void*>(&D3D12Hook::rs_set_viewports),
+                m_rs_set_viewports_hooks,
+                m_rs_set_viewports_hook_lookup,
+                rs_set_viewports_slots
+            );
+        }
+
         m_hooked = true;
     } catch (const std::exception& e) {
         spdlog::error("Failed to initialize hooks: {}", e.what());
         m_hooked = false;
+    }
+
+    if (command_list != nullptr) {
+        command_list->Release();
+    }
+
+    if (command_allocator != nullptr) {
+        command_allocator->Release();
     }
 
     device->Release();
@@ -377,12 +547,126 @@ bool D3D12Hook::unhook() {
 
     m_present_hook.reset();
     m_present1_hook.reset();
+    m_create_render_target_view_hooks.clear();
+    m_om_set_render_targets_hooks.clear();
+    m_rs_set_viewports_hooks.clear();
+    m_create_render_target_view_hook_lookup.clear();
+    m_om_set_render_targets_hook_lookup.clear();
+    m_rs_set_viewports_hook_lookup.clear();
     m_swapchain_hook.reset();
 
     m_hooked = false;
     m_is_phase_1 = true;
 
     return true;
+}
+
+PointerHook* D3D12Hook::find_create_render_target_view_hook(void* slot) const {
+    if (const auto it = m_create_render_target_view_hook_lookup.find(reinterpret_cast<uintptr_t>(slot)); it != m_create_render_target_view_hook_lookup.end()) {
+        return it->second;
+    }
+
+    return m_create_render_target_view_hooks.empty() ? nullptr : m_create_render_target_view_hooks.front().get();
+}
+
+PointerHook* D3D12Hook::find_om_set_render_targets_hook(void* slot) const {
+    if (const auto it = m_om_set_render_targets_hook_lookup.find(reinterpret_cast<uintptr_t>(slot)); it != m_om_set_render_targets_hook_lookup.end()) {
+        return it->second;
+    }
+
+    return m_om_set_render_targets_hooks.empty() ? nullptr : m_om_set_render_targets_hooks.front().get();
+}
+
+PointerHook* D3D12Hook::find_rs_set_viewports_hook(void* slot) const {
+    if (const auto it = m_rs_set_viewports_hook_lookup.find(reinterpret_cast<uintptr_t>(slot)); it != m_rs_set_viewports_hook_lookup.end()) {
+        return it->second;
+    }
+
+    return m_rs_set_viewports_hooks.empty() ? nullptr : m_rs_set_viewports_hooks.front().get();
+}
+
+void WINAPI D3D12Hook::create_render_target_view(
+    ID3D12Device* device,
+    ID3D12Resource* resource,
+    const D3D12_RENDER_TARGET_VIEW_DESC* desc,
+    D3D12_CPU_DESCRIPTOR_HANDLE descriptor
+) {
+    auto d3d12 = g_d3d12_hook;
+    const auto slot = device != nullptr ? &(*(void***)device)[CREATE_RENDER_TARGET_VIEW_VTABLE_INDEX] : nullptr;
+    auto* hook = d3d12 != nullptr ? d3d12->find_create_render_target_view_hook(slot) : nullptr;
+    auto original = hook != nullptr ? hook->get_original<decltype(D3D12Hook::create_render_target_view)*>() : nullptr;
+
+    if (original != nullptr) {
+        original(device, resource, desc, descriptor);
+    }
+
+    render::VRSInjector::get().register_rtv(resource, descriptor);
+}
+
+void WINAPI D3D12Hook::om_set_render_targets(
+    ID3D12GraphicsCommandList* command_list,
+    UINT num_render_target_descriptors,
+    const D3D12_CPU_DESCRIPTOR_HANDLE* render_target_descriptors,
+    BOOL rts_single_handle_to_descriptor_range,
+    const D3D12_CPU_DESCRIPTOR_HANDLE* depth_stencil_descriptor)
+{
+    auto d3d12 = g_d3d12_hook;
+    const auto slot = command_list != nullptr ? &(*(void***)command_list)[OM_SET_RENDER_TARGETS_VTABLE_INDEX] : nullptr;
+    auto* hook = d3d12 != nullptr ? d3d12->find_om_set_render_targets_hook(slot) : nullptr;
+    auto original = hook != nullptr ? hook->get_original<decltype(D3D12Hook::om_set_render_targets)*>() : nullptr;
+
+    if (original == nullptr) {
+        // During a re-hook/unhook the PointerHook can momentarily be gone (hook
+        // vectors cleared, or g_d3d12_hook torn down). Dropping the game's bind
+        // would leave later draws pointing at stale render targets, so fall back
+        // to the live vtable entry as long as it isn't our own detour (which
+        // would recurse).
+        if (slot != nullptr) {
+            const auto current = reinterpret_cast<decltype(D3D12Hook::om_set_render_targets)*>(*slot);
+
+            if (current != nullptr && current != &D3D12Hook::om_set_render_targets) {
+                current(command_list, num_render_target_descriptors, render_target_descriptors,
+                    rts_single_handle_to_descriptor_range, depth_stencil_descriptor);
+            }
+        }
+
+        return;
+    }
+
+    original(command_list, num_render_target_descriptors, render_target_descriptors,
+        rts_single_handle_to_descriptor_range, depth_stencil_descriptor);
+
+    render::VRSInjector::get().on_om_set_render_targets(command_list, num_render_target_descriptors,
+        render_target_descriptors, rts_single_handle_to_descriptor_range, depth_stencil_descriptor);
+}
+
+void WINAPI D3D12Hook::rs_set_viewports(
+    ID3D12GraphicsCommandList* command_list,
+    UINT num_viewports,
+    const D3D12_VIEWPORT* viewports)
+{
+    auto d3d12 = g_d3d12_hook;
+    const auto slot = command_list != nullptr ? &(*(void***)command_list)[RS_SET_VIEWPORTS_VTABLE_INDEX] : nullptr;
+    auto* hook = d3d12 != nullptr ? d3d12->find_rs_set_viewports_hook(slot) : nullptr;
+    auto original = hook != nullptr ? hook->get_original<decltype(D3D12Hook::rs_set_viewports)*>() : nullptr;
+
+    if (original == nullptr) {
+        // See om_set_render_targets: fall back to the live vtable entry during a
+        // re-hook rather than dropping the game's viewport set.
+        if (slot != nullptr) {
+            const auto current = reinterpret_cast<decltype(D3D12Hook::rs_set_viewports)*>(*slot);
+
+            if (current != nullptr && current != &D3D12Hook::rs_set_viewports) {
+                current(command_list, num_viewports, viewports);
+            }
+        }
+
+        return;
+    }
+
+    original(command_list, num_viewports, viewports);
+
+    render::VRSInjector::get().on_rs_set_viewports(command_list, num_viewports, viewports);
 }
 
 thread_local int32_t g_present_depth = 0;

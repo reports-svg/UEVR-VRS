@@ -299,7 +299,8 @@ std::optional<std::string> VR::initialize_openxr() {
 
                 const std::unordered_set<std::string> wanted_extensions {
                     XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME,
-                    XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME
+                    XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME,
+                    XR_EXT_EYE_GAZE_INTERACTION_EXTENSION_NAME // for eye-tracked foveated rendering
                     // To be seen if we need more!
                 };
 
@@ -1368,6 +1369,7 @@ void VR::on_pre_engine_tick(sdk::UGameEngine* engine, float delta) {
     ZoneScopedN(__FUNCTION__);
 
     m_cvar_manager->on_pre_engine_tick(engine, delta);
+    m_foveated_rendering->on_pre_engine_tick(engine, delta);
     m_last_engine_tick = std::chrono::steady_clock::now();
 
     if (!get_runtime()->loaded || !is_hmd_active()) {
@@ -1773,7 +1775,11 @@ void VR::on_config_load(const utility::Config& cfg, bool set_defaults) {
     m_overlay_component.on_config_load(cfg, set_defaults);
 
     if (m_cvar_manager != nullptr) {
-        m_cvar_manager->on_config_load(cfg, set_defaults);   
+        m_cvar_manager->on_config_load(cfg, set_defaults);
+    }
+
+    if (m_foveated_rendering != nullptr) {
+        m_foveated_rendering->on_config_load(cfg, set_defaults);
     }
 
     // Load camera offsets
@@ -1796,6 +1802,10 @@ void VR::on_config_save(utility::Config& cfg) {
     }
 
     m_overlay_component.on_config_save(cfg);
+
+    if (m_foveated_rendering != nullptr) {
+        m_foveated_rendering->on_config_save(cfg);
+    }
 
     // Save camera offsets
     save_cameras();
@@ -1966,6 +1976,7 @@ void VR::on_frame() {
     ZoneScopedN(__FUNCTION__);
 
     m_cvar_manager->on_frame();
+    m_foveated_rendering->on_frame();
     handle_keybinds();
 
     if (!get_runtime()->ready()) {
@@ -2300,6 +2311,7 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
         PAGE_UNREAL,
         PAGE_INPUT,
         PAGE_CAMERA,
+        PAGE_FOVEATED,
         PAGE_KEYBINDS,
         PAGE_CONSOLE,
         PAGE_COMPATIBILITY,
@@ -2357,6 +2369,9 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
         break;
     case "Camera"_fnv:
         selected_page = PAGE_CAMERA;
+        break;
+    case "Foveated (VRS)"_fnv:
+        selected_page = PAGE_FOVEATED;
         break;
     case "Keybinds"_fnv:
         selected_page = PAGE_KEYBINDS;
@@ -2612,6 +2627,10 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
 
             ImGui::TreePop();
         }
+    }
+
+    if (selected_page == PAGE_FOVEATED) {
+        m_foveated_rendering->on_draw_ui();
     }
 
     if (selected_page == PAGE_CONSOLE) {

@@ -17,6 +17,7 @@
 #include "vr/FFakeStereoRenderingHook.hpp"
 #include "vr/RenderTargetPoolHook.hpp"
 #include "vr/CVarManager.hpp"
+#include "vr/FoveatedRendering.hpp"
 
 #include "Mod.hpp"
 
@@ -113,6 +114,7 @@ public:
             {"Unreal", false},
             {"Input", false},
             {"Camera", false},
+            {"Foveated (VRS)", false},
             {"Keybinds", false},
             {"Console/CVars", true},
             {"Compatibility", true},
@@ -143,6 +145,10 @@ public:
 
         if (m_fake_stereo_hook != nullptr) {
             m_fake_stereo_hook->on_device_reset();
+        }
+
+        if (m_foveated_rendering != nullptr) {
+            m_foveated_rendering->on_device_reset();
         }
 
         if (m_is_d3d12) {
@@ -297,6 +303,13 @@ public:
 
     auto get_frame_count() const {
         return m_frame_count;
+    }
+
+    // Which eye the current frame renders under AFR (alternate-frame rendering).
+    // Non-AFR / double-wide renders both eyes together, reported as left. Mirrors
+    // get_current_offset()'s convention so callers agree on the current eye.
+    bool is_current_frame_left_eye() const {
+        return !is_using_afr() || (m_frame_count % 2 == m_left_eye_interval);
     }
 
     auto& get_controllers() const {
@@ -562,6 +575,10 @@ public:
         return m_fake_stereo_hook;
     }
 
+    auto& get_foveated_rendering() {
+        return m_foveated_rendering;
+    }
+
     void set_pre_flattened_rotation(const glm::quat& rot) {
         std::unique_lock _{m_decoupled_pitch_data.mtx};
         m_decoupled_pitch_data.pre_flattened_rotation = rot;
@@ -717,12 +734,14 @@ private:
     std::unique_ptr<FFakeStereoRenderingHook> m_fake_stereo_hook{ std::make_unique<FFakeStereoRenderingHook>() };
     std::unique_ptr<RenderTargetPoolHook> m_render_target_pool_hook{ std::make_unique<RenderTargetPoolHook>() };
     std::unique_ptr<CVarManager> m_cvar_manager{ std::make_unique<CVarManager>() };
+    std::unique_ptr<FoveatedRendering> m_foveated_rendering{ std::make_unique<FoveatedRendering>() };
 
     void add_components_vr() {
         m_components = {
             m_fake_stereo_hook.get(),
             m_render_target_pool_hook.get(),
             m_cvar_manager.get(),
+            m_foveated_rendering.get(),
             &m_overlay_component
         };
     }

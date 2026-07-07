@@ -2,6 +2,9 @@
 
 #include <iostream>
 #include <functional>
+#include <memory>
+#include <unordered_map>
+#include <vector>
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi")
@@ -126,6 +129,15 @@ protected:
 
     std::unique_ptr<PointerHook> m_present_hook{};
     std::unique_ptr<PointerHook> m_present1_hook{};
+    // VRS foveated rendering: hooks on the D3D12 device/command-list vtables so the
+    // VRSInjector can track RTV creation and scene passes (one hook per unique
+    // vtable slot across the QI'd interface hierarchy).
+    std::vector<std::unique_ptr<PointerHook>> m_create_render_target_view_hooks{};
+    std::vector<std::unique_ptr<PointerHook>> m_om_set_render_targets_hooks{};
+    std::vector<std::unique_ptr<PointerHook>> m_rs_set_viewports_hooks{};
+    std::unordered_map<uintptr_t, PointerHook*> m_create_render_target_view_hook_lookup{};
+    std::unordered_map<uintptr_t, PointerHook*> m_om_set_render_targets_hook_lookup{};
+    std::unordered_map<uintptr_t, PointerHook*> m_rs_set_viewports_hook_lookup{};
     std::unique_ptr<VtableHook> m_swapchain_hook{};
     //std::unique_ptr<FunctionHook> m_create_swap_chain_hook{};
 
@@ -139,8 +151,23 @@ protected:
 
     static HRESULT WINAPI present(IDXGISwapChain3* swap_chain, UINT sync_interval, UINT flags);
     static HRESULT WINAPI present1(IDXGISwapChain3* swap_chain, UINT sync_interval, UINT flags, DXGI_PRESENT_PARAMETERS* params);
+    static void WINAPI create_render_target_view(ID3D12Device* device, ID3D12Resource* resource, const D3D12_RENDER_TARGET_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE descriptor);
+    static void WINAPI om_set_render_targets(
+        ID3D12GraphicsCommandList* command_list,
+        UINT num_render_target_descriptors,
+        const D3D12_CPU_DESCRIPTOR_HANDLE* render_target_descriptors,
+        BOOL rts_single_handle_to_descriptor_range,
+        const D3D12_CPU_DESCRIPTOR_HANDLE* depth_stencil_descriptor);
+    static void WINAPI rs_set_viewports(
+        ID3D12GraphicsCommandList* command_list,
+        UINT num_viewports,
+        const D3D12_VIEWPORT* viewports);
     static HRESULT WINAPI resize_buffers(IDXGISwapChain3* swap_chain, UINT buffer_count, UINT width, UINT height, DXGI_FORMAT new_format, UINT swap_chain_flags);
     static HRESULT WINAPI resize_target(IDXGISwapChain3* swap_chain, const DXGI_MODE_DESC* new_target_parameters);
     //static HRESULT WINAPI create_swap_chain(IDXGIFactory4* factory, IUnknown* device, HWND hwnd, const DXGI_SWAP_CHAIN_DESC* desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* p_fullscreen_desc, IDXGIOutput* p_restrict_to_output, IDXGISwapChain** swap_chain);
+
+    PointerHook* find_create_render_target_view_hook(void* slot) const;
+    PointerHook* find_om_set_render_targets_hook(void* slot) const;
+    PointerHook* find_rs_set_viewports_hook(void* slot) const;
 };
 
