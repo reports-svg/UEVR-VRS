@@ -79,6 +79,7 @@ FoveatedRendering::FoveatedRendering() {
         *m_gaze_tracking,
         *m_gaze_smoothing,
         *m_engine_preview,
+        *m_debug_preview,
         *m_require_depth,
         *m_use_optical_centers,
         *m_center_offset_x,
@@ -419,6 +420,8 @@ void FoveatedRendering::update_injected_path() {
     render::VRSInjector::FoveationDesc desc{};
     desc.enabled = false;
 
+    m_preview.valid = false;
+
     utility::ScopeGuard push_desc{[&]() {
         render::VRSInjector::get().update(desc);
     }};
@@ -522,10 +525,133 @@ void FoveatedRendering::update_injected_path() {
     }
 
     desc.enabled = true;
+
+    // Snapshot the final pattern for the debug preview (same thread as the UI).
+    m_preview.valid = true;
+    m_preview.double_wide = desc.double_wide;
+    m_preview.allow_4x4 = desc.allow_4x4;
+    m_preview.full_cutoff_sq = full_cutoff * full_cutoff;
+    m_preview.half_cutoff_sq = half_cutoff * half_cutoff;
+    {
+        const uint32_t num_eyes = desc.double_wide ? 2u : 1u;
+        const float eye_w = (float)desc.scene_width / (float)num_eyes;
+        m_preview.eye_aspect = desc.scene_height > 0 ? eye_w / (float)desc.scene_height : 1.0f;
+    }
+    m_preview.center_u[0] = desc.center_u[0];
+    m_preview.center_v[0] = desc.center_v[0];
+    m_preview.center_u[1] = desc.center_u[1];
+    m_preview.center_v[1] = desc.center_v[1];
 }
 
 void FoveatedRendering::on_frame() {
     update_injected_path();
+}
+
+int FoveatedRendering::preview_rate_at(float u, float v) const {
+    const auto& p = m_preview;
+
+    // Which eye and where within that eye (0..1).
+    int eye = 0;
+    float eu = u;
+
+    if (p.double_wide) {
+        eye = (u >= 0.5f) ? 1 : 0;
+        eu = (u - (float)eye * 0.5f) * 2.0f;
+    }
+
+    const float ev = v;
+    const float du = eu - p.center_u[eye];
+    const float dv = ev - p.center_v[eye];
+
+    // Squared distance normalized by the per-eye half-diagonal, matching
+    // VRSInjector's generation (factored to need only the eye aspect ratio).
+    const float r = p.eye_aspect;
+    const float r2 = r * r;
+    const float d2 = 4.0f * (du * du * r2 + dv * dv) / (r2 + 1.0f);
+
+    if (d2 > p.half_cutoff_sq) {
+        return p.allow_4x4 ? 2 : 1;
+    }
+    if (d2 > p.full_cutoff_sq) {
+        return 1;
+    }
+    return 0;
+}
+
+void FoveatedRendering::draw_debug_preview() {
+    if (!m_preview.valid) {
+        ImGui::TextWrapped("Debug preview: injected VRS is not active yet (no scene target).");
+        return;
+    }
+
+    // UE-style rate colors: green = full 1x1, yellow = 2x2, red = coarsest.
+    const ImU32 col_1x1 = IM_COL32(40, 200, 60, 255);
+    const ImU32 col_2x2 = IM_COL32(230, 205, 40, 255);
+    const ImU32 col_4x4 = IM_COL32(225, 55, 45, 255);
+    const ImU32 rate_cols[3]{col_1x1, col_2x2, col_4x4};
+
+    const int num_eyes = m_preview.double_wide ? 2 : 1;
+    const float full_aspect = m_preview.eye_aspect * (float)num_eyes; // width/height
+
+    float width = ImGui::GetContentRegionAvail().x;
+    width = std::clamp(width, 120.0f, 460.0f);
+    float height = full_aspect > 0.01f ? width / full_aspect : width * 0.5f;
+    height = std::clamp(height, 60.0f, 320.0f);
+
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
+    auto* dl = ImGui::GetWindowDrawList();
+
+    // Sample a grid of cells and fill by rate class.
+    const int cols = 112;
+    const int rows = std::max(1, (int)(cols / std::max(0.1f, full_aspect)));
+    const float cw = width / (float)cols;
+    const float ch = height / (float)rows;
+
+    for (int y = 0; y < rows; ++y) {
+        const float v = ((float)y + 0.5f) / (float)rows;
+        for (int x = 0; x < cols; ++x) {
+            const float u = ((float)x + 0.5f) / (float)cols;
+            const int rate = preview_rate_at(u, v);
+            const ImVec2 p0{origin.x + x * cw, origin.y + y * ch};
+            const ImVec2 p1{p0.x + cw + 1.0f, p0.y + ch + 1.0f};
+            dl->AddRectFilled(p0, p1, rate_cols[rate]);
+        }
+    }
+
+    // Eye-split line and per-eye center crosshairs.
+    if (m_preview.double_wide) {
+        dl->AddLine(ImVec2(origin.x + width * 0.5f, origin.y),
+                    ImVec2(origin.x + width * 0.5f, origin.y + height), IM_COL32(0, 0, 0, 160), 1.0f);
+    }
+
+    for (int eye = 0; eye < num_eyes; ++eye) {
+        const float eye_off = m_preview.double_wide ? (float)eye * 0.5f : 0.0f;
+        const float eye_w = m_preview.double_wide ? 0.5f : 1.0f;
+        const float cx = origin.x + (eye_off + m_preview.center_u[eye] * eye_w) * width;
+        const float cy = origin.y + m_preview.center_v[eye] * height;
+        dl->AddCircle(ImVec2(cx, cy), 5.0f, IM_COL32(255, 255, 255, 230), 12, 1.5f);
+        dl->AddLine(ImVec2(cx - 7, cy), ImVec2(cx + 7, cy), IM_COL32(255, 255, 255, 230), 1.0f);
+        dl->AddLine(ImVec2(cx, cy - 7), ImVec2(cx, cy + 7), IM_COL32(255, 255, 255, 230), 1.0f);
+    }
+
+    dl->AddRect(origin, ImVec2(origin.x + width, origin.y + height), IM_COL32(255, 255, 255, 90));
+    ImGui::Dummy(ImVec2(width, height));
+
+    // Legend.
+    auto swatch = [&](ImU32 c, const char* label) {
+        const ImVec2 pos = ImGui::GetCursorScreenPos();
+        ImGui::GetWindowDrawList()->AddRectFilled(pos, ImVec2(pos.x + 12, pos.y + 12), c);
+        ImGui::Dummy(ImVec2(14, 12));
+        ImGui::SameLine();
+        ImGui::TextUnformatted(label);
+    };
+    swatch(col_1x1, "1x1 (full)");
+    ImGui::SameLine();
+    swatch(col_2x2, "2x2");
+    if (m_preview.allow_4x4) {
+        ImGui::SameLine();
+        swatch(col_4x4, "4x4");
+    }
 }
 
 void FoveatedRendering::on_device_reset() {
@@ -695,6 +821,17 @@ void FoveatedRendering::on_draw_ui() {
                 ImGui::TextWrapped(
                     "No render-target binds matched the scene target this frame. "
                     "Try disabling 'Only Passes With Depth Bound' in the advanced options.");
+            }
+
+            ImGui::Separator();
+            m_debug_preview->draw("Debug Preview (Shading-Rate Map)");
+            help_marker(
+                "Injected-path analog of the engine's r.VRS.Preview: shows a color-coded map of the "
+                "shading-rate image UEVR is generating this frame (green=1x1 full, yellow=2x2, red=4x4), "
+                "with each eye's foveation center marked. Updates live as you adjust the settings.");
+
+            if (m_debug_preview->value()) {
+                draw_debug_preview();
             }
         }
     }
