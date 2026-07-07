@@ -99,6 +99,14 @@ private:
     // Returns per-eye foveation centers in per-eye UV space.
     void compute_eye_centers(float (&center_u)[2], float (&center_v)[2], float preset_center_v);
 
+    // Debug preview: draws a color-coded map of the shading-rate image the
+    // injector is actually generating (green=1x1, yellow=2x2, red=4x4), the
+    // injected-path analog of the engine's r.VRS.Preview overlay.
+    void draw_debug_preview();
+    // Rate class (0=1x1, 1=2x2, 2=4x4) at a full-frame normalized position,
+    // using the last pattern published to the injector.
+    int preview_rate_at(float u, float v) const;
+
     const ModCombo::Ptr m_mode{ ModCombo::create(generate_name("Mode"),
         {"Disabled", "Engine Native (CVars)", "Injected (D3D12)"}, MODE_DISABLED) };
     const ModCombo::Ptr m_level{ ModCombo::create(generate_name("Level"),
@@ -114,6 +122,7 @@ private:
     const ModToggle::Ptr m_gaze_tracking{ ModToggle::create(generate_name("GazeTracking"), false) };
     const ModSlider::Ptr m_gaze_smoothing{ ModSlider::create(generate_name("GazeSmoothing"), 0.0f, 0.95f, 0.6f, true) };
     const ModToggle::Ptr m_engine_preview{ ModToggle::create(generate_name("EnginePreview"), false) };
+    const ModToggle::Ptr m_debug_preview{ ModToggle::create(generate_name("DebugPreview"), false) };
     const ModToggle::Ptr m_require_depth{ ModToggle::create(generate_name("InjectedRequireDepth"), true, true) };
     const ModToggle::Ptr m_use_optical_centers{ ModToggle::create(generate_name("UseOpticalCenters"), true, true) };
     const ModSlider::Ptr m_center_offset_x{ ModSlider::create(generate_name("CenterOffsetX"), -0.4f, 0.4f, 0.0f, true) };
@@ -128,4 +137,17 @@ private:
     float m_smoothed_gaze_u[2]{0.5f, 0.5f};
     float m_smoothed_gaze_v[2]{0.5f, 0.5f};
     bool m_gaze_was_valid{false};
+
+    // Snapshot of the last pattern published to the injector, so the debug
+    // preview shows exactly what is being generated (updated in on_frame).
+    struct PreviewState {
+        bool valid{false};
+        bool double_wide{true};
+        bool allow_4x4{true};
+        float full_cutoff_sq{0.25f};
+        float half_cutoff_sq{0.5625f};
+        float eye_aspect{1.0f}; // per-eye width/height, for correct ring shape
+        float center_u[2]{0.5f, 0.5f};
+        float center_v[2]{0.5f, 0.5f};
+    } m_preview{};
 };
