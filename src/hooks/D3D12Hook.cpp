@@ -15,6 +15,7 @@
 #include "Framework.hpp"
 #include "render/D3D12Diagnostics.hpp"
 #include "render/ShaderOverrideRegistry.hpp"
+#include "render/VRSInjector.hpp"
 
 #include "D3D12Hook.hpp"
 
@@ -495,11 +496,15 @@ bool D3D12Hook::hook() {
         m_create_render_target_view_hooks.clear();
         m_create_depth_stencil_view_hooks.clear();
         m_set_pipeline_state_hooks.clear();
+        m_om_set_render_targets_hooks.clear();
+        m_rs_set_viewports_hooks.clear();
         m_create_graphics_pipeline_state_hook_lookup.clear();
         m_create_pipeline_state_hook_lookup.clear();
         m_create_render_target_view_hook_lookup.clear();
         m_create_depth_stencil_view_hook_lookup.clear();
         m_set_pipeline_state_hook_lookup.clear();
+        m_om_set_render_targets_hook_lookup.clear();
+        m_rs_set_viewports_hook_lookup.clear();
         m_swapchain_hook.reset();
 
         m_is_phase_1 = true;
@@ -514,6 +519,8 @@ bool D3D12Hook::hook() {
         std::unordered_set<uintptr_t> render_target_view_slots{};
         std::unordered_set<uintptr_t> depth_stencil_view_slots{};
         std::unordered_set<uintptr_t> set_pipeline_state_slots{};
+        std::unordered_set<uintptr_t> om_set_render_targets_slots{};
+        std::unordered_set<uintptr_t> rs_set_viewports_slots{};
 
         add_unique_pointer_hook(
             device,
@@ -620,6 +627,24 @@ bool D3D12Hook::hook() {
             set_pipeline_state_slots
         );
 
+        add_unique_pointer_hook(
+            command_list,
+            OM_SET_RENDER_TARGETS_VTABLE_INDEX,
+            reinterpret_cast<void*>(&D3D12Hook::om_set_render_targets),
+            m_om_set_render_targets_hooks,
+            m_om_set_render_targets_hook_lookup,
+            om_set_render_targets_slots
+        );
+
+        add_unique_pointer_hook(
+            command_list,
+            RS_SET_VIEWPORTS_VTABLE_INDEX,
+            reinterpret_cast<void*>(&D3D12Hook::rs_set_viewports),
+            m_rs_set_viewports_hooks,
+            m_rs_set_viewports_hook_lookup,
+            rs_set_viewports_slots
+        );
+
         Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList1> command_list1{};
         Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList2> command_list2{};
         Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList3> command_list3{};
@@ -654,6 +679,24 @@ bool D3D12Hook::hook() {
                 m_set_pipeline_state_hooks,
                 m_set_pipeline_state_hook_lookup,
                 set_pipeline_state_slots
+            );
+
+            add_unique_pointer_hook(
+                iface,
+                OM_SET_RENDER_TARGETS_VTABLE_INDEX,
+                reinterpret_cast<void*>(&D3D12Hook::om_set_render_targets),
+                m_om_set_render_targets_hooks,
+                m_om_set_render_targets_hook_lookup,
+                om_set_render_targets_slots
+            );
+
+            add_unique_pointer_hook(
+                iface,
+                RS_SET_VIEWPORTS_VTABLE_INDEX,
+                reinterpret_cast<void*>(&D3D12Hook::rs_set_viewports),
+                m_rs_set_viewports_hooks,
+                m_rs_set_viewports_hook_lookup,
+                rs_set_viewports_slots
             );
         }
 
@@ -702,11 +745,15 @@ bool D3D12Hook::unhook() {
     m_create_render_target_view_hooks.clear();
     m_create_depth_stencil_view_hooks.clear();
     m_set_pipeline_state_hooks.clear();
+    m_om_set_render_targets_hooks.clear();
+    m_rs_set_viewports_hooks.clear();
     m_create_graphics_pipeline_state_hook_lookup.clear();
     m_create_pipeline_state_hook_lookup.clear();
     m_create_render_target_view_hook_lookup.clear();
     m_create_depth_stencil_view_hook_lookup.clear();
     m_set_pipeline_state_hook_lookup.clear();
+    m_om_set_render_targets_hook_lookup.clear();
+    m_rs_set_viewports_hook_lookup.clear();
     m_swapchain_hook.reset();
 
     m_hooked = false;
@@ -745,6 +792,22 @@ PointerHook* D3D12Hook::find_create_depth_stencil_view_hook(void* slot) const {
     }
 
     return m_create_depth_stencil_view_hooks.empty() ? nullptr : m_create_depth_stencil_view_hooks.front().get();
+}
+
+PointerHook* D3D12Hook::find_om_set_render_targets_hook(void* slot) const {
+    if (const auto it = m_om_set_render_targets_hook_lookup.find(reinterpret_cast<uintptr_t>(slot)); it != m_om_set_render_targets_hook_lookup.end()) {
+        return it->second;
+    }
+
+    return m_om_set_render_targets_hooks.empty() ? nullptr : m_om_set_render_targets_hooks.front().get();
+}
+
+PointerHook* D3D12Hook::find_rs_set_viewports_hook(void* slot) const {
+    if (const auto it = m_rs_set_viewports_hook_lookup.find(reinterpret_cast<uintptr_t>(slot)); it != m_rs_set_viewports_hook_lookup.end()) {
+        return it->second;
+    }
+
+    return m_rs_set_viewports_hooks.empty() ? nullptr : m_rs_set_viewports_hooks.front().get();
 }
 
 PointerHook* D3D12Hook::find_set_pipeline_state_hook(void* slot) const {
@@ -1064,6 +1127,7 @@ void WINAPI D3D12Hook::create_render_target_view(
     }
 
     render::D3D12Diagnostics::get().register_rtv_descriptor("D3D12Hook::CreateRenderTargetView", resource, descriptor);
+    render::VRSInjector::get().register_rtv(resource, descriptor);
 }
 
 void WINAPI D3D12Hook::create_depth_stencil_view(
@@ -1104,6 +1168,72 @@ void WINAPI D3D12Hook::set_pipeline_state(ID3D12GraphicsCommandList* command_lis
     auto bound_pipeline_state = shader_registry.resolve_d3d12_pipeline_state(pipeline_state);
     shader_registry.note_d3d12_pipeline_state_bound(pipeline_state, bound_pipeline_state);
     original(command_list, bound_pipeline_state);
+}
+
+void WINAPI D3D12Hook::om_set_render_targets(
+    ID3D12GraphicsCommandList* command_list,
+    UINT num_render_target_descriptors,
+    const D3D12_CPU_DESCRIPTOR_HANDLE* render_target_descriptors,
+    BOOL rts_single_handle_to_descriptor_range,
+    const D3D12_CPU_DESCRIPTOR_HANDLE* depth_stencil_descriptor)
+{
+    auto d3d12 = g_d3d12_hook;
+    const auto slot = command_list != nullptr ? &(*(void***)command_list)[OM_SET_RENDER_TARGETS_VTABLE_INDEX] : nullptr;
+    auto* hook = d3d12 != nullptr ? d3d12->find_om_set_render_targets_hook(slot) : nullptr;
+    auto original = hook != nullptr ? hook->get_original<decltype(D3D12Hook::om_set_render_targets)*>() : nullptr;
+
+    if (original == nullptr) {
+        // During a re-hook/unhook the PointerHook can momentarily be gone (hook
+        // vectors cleared, or g_d3d12_hook torn down). Dropping the game's bind
+        // would leave later draws pointing at stale render targets, so fall back
+        // to the live vtable entry as long as it isn't our own detour (which
+        // would recurse).
+        if (slot != nullptr) {
+            const auto current = reinterpret_cast<decltype(D3D12Hook::om_set_render_targets)*>(*slot);
+
+            if (current != nullptr && current != &D3D12Hook::om_set_render_targets) {
+                current(command_list, num_render_target_descriptors, render_target_descriptors,
+                    rts_single_handle_to_descriptor_range, depth_stencil_descriptor);
+            }
+        }
+
+        return;
+    }
+
+    original(command_list, num_render_target_descriptors, render_target_descriptors,
+        rts_single_handle_to_descriptor_range, depth_stencil_descriptor);
+
+    render::VRSInjector::get().on_om_set_render_targets(command_list, num_render_target_descriptors,
+        render_target_descriptors, rts_single_handle_to_descriptor_range, depth_stencil_descriptor);
+}
+
+void WINAPI D3D12Hook::rs_set_viewports(
+    ID3D12GraphicsCommandList* command_list,
+    UINT num_viewports,
+    const D3D12_VIEWPORT* viewports)
+{
+    auto d3d12 = g_d3d12_hook;
+    const auto slot = command_list != nullptr ? &(*(void***)command_list)[RS_SET_VIEWPORTS_VTABLE_INDEX] : nullptr;
+    auto* hook = d3d12 != nullptr ? d3d12->find_rs_set_viewports_hook(slot) : nullptr;
+    auto original = hook != nullptr ? hook->get_original<decltype(D3D12Hook::rs_set_viewports)*>() : nullptr;
+
+    if (original == nullptr) {
+        // See om_set_render_targets: fall back to the live vtable entry during a
+        // re-hook rather than dropping the game's viewport set.
+        if (slot != nullptr) {
+            const auto current = reinterpret_cast<decltype(D3D12Hook::rs_set_viewports)*>(*slot);
+
+            if (current != nullptr && current != &D3D12Hook::rs_set_viewports) {
+                current(command_list, num_viewports, viewports);
+            }
+        }
+
+        return;
+    }
+
+    original(command_list, num_viewports, viewports);
+
+    render::VRSInjector::get().on_rs_set_viewports(command_list, num_viewports, viewports);
 }
 
 thread_local int32_t g_resize_buffers_depth = 0;

@@ -76,6 +76,23 @@ struct OpenXR final : public VRRuntime {
         return this->enabled_extensions.contains(XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME);
     }
 
+    // XR_EXT_eye_gaze_interaction, initialized alongside the default action set.
+    bool has_eye_gaze() const {
+        return this->eye_gaze.space != XR_NULL_HANDLE;
+    }
+
+    // Head-relative gaze direction (OpenXR view space: X right, Y up, -Z forward).
+    // Empty when the runtime has no gaze data this frame.
+    std::optional<Vector3f> get_eye_gaze_direction() {
+        std::scoped_lock _{this->eye_gaze.mtx};
+
+        if (!this->eye_gaze.valid) {
+            return std::nullopt;
+        }
+
+        return this->eye_gaze.direction;
+    }
+
     void on_system_properties_acquired(const XrSystemProperties& props);
 
     void on_config_load(const utility::Config& cfg, bool set_defaults) override;
@@ -243,6 +260,15 @@ public:
 
     std::unordered_set<std::string> enabled_extensions{};
     std::vector<XrCompositionLayerProjection> projection_layer_cache{};
+
+    struct EyeGaze {
+        XrAction action{XR_NULL_HANDLE};
+        XrSpace space{XR_NULL_HANDLE};
+        std::mutex mtx{};
+        Vector3f direction{0.0f, 0.0f, -1.0f};
+        bool valid{false};
+        bool binding_suggested{false};
+    } eye_gaze{};
 
     std::vector<XrViewConfigurationView> view_configs{};
     std::unordered_map<uint32_t, Swapchain> swapchains{}; // SwapchainIndex -> Swapchain
