@@ -846,7 +846,9 @@ void FoveatedRendering::on_draw_ui() {
             help_marker(
                 "When the game renders internally at a reduced resolution (DLSS/FSR2/TSR/ScreenPercentage), "
                 "build correctly-scaled shading-rate images for that resolution and stop touching "
-                "display-resolution passes (which are post-upscale). Leave on unless it misdetects passes.");
+                "display-resolution passes (which are post-upscale). If the status below reports "
+                "'display-res passes excluded' while NO upscaler is running, the game has its own "
+                "reduced-resolution pass fooling the detector - turn this off.");
             m_lens_mask->draw("Lens Mask (Coarsen Invisible Corners)");
             help_marker(
                 "Forces tiles outside an ellipse anchored at each eye's optical center to the coarsest rate. "

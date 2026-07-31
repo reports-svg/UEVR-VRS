@@ -65,8 +65,9 @@ void VRSInjector::register_rtv(ID3D12Resource* resource, D3D12_CPU_DESCRIPTOR_HA
 
 int VRSInjector::find_variant_for_target(uint32_t w, uint32_t h) const {
     for (size_t i = 0; i < MAX_VARIANTS; ++i) {
-        const auto vw = m_variants[i].pub_width.load(std::memory_order_relaxed);
-        const auto vh = m_variants[i].pub_height.load(std::memory_order_relaxed);
+        const auto packed = m_variants[i].pub_dims.load(std::memory_order_relaxed);
+        const auto vw = (uint32_t)(packed >> 32);
+        const auto vh = (uint32_t)packed;
 
         if (vw == 0 || vh == 0) {
             continue;
@@ -102,19 +103,7 @@ bool VRSInjector::is_subres_scene_candidate(uint32_t w, uint32_t h) const {
 
     const float sx_full = (float)w / (float)pw;
 
-    if (std::fabs(sx_full - sy) <= 0.015f) {
-        return true;
-    }
-
-    if (m_double_wide.load(std::memory_order_relaxed)) {
-        const float sx_half = (float)w / ((float)pw * 0.5f);
-
-        if (std::fabs(sx_half - sy) <= 0.015f) {
-            return true;
-        }
-    }
-
-    return false;
+    return std::fabs(sx_full - sy) <= 0.015f;
 }
 
 void VRSInjector::request_subres_variant(uint32_t w, uint32_t h) {
@@ -153,27 +142,49 @@ ID3D12Resource* VRSInjector::match_rtv_bind(
         return nullptr;
     }
 
+    const bool has_depth = depth_stencil != nullptr && depth_stencil->ptr != 0;
     const auto vi = find_variant_for_target(info.width, info.height);
 
     if (vi >= 0) {
-        // While upscaler render-resolution activity is live, display-resolution
-        // binds are post-upscale passes - coarse-shading those puts blockiness
-        // straight into the final image with no temporal filter behind it.
-        if (vi == 0 && m_suppress_fullres.load(std::memory_order_relaxed)) {
+        auto& variant = m_variants[vi];
+        const auto matched_dims = variant.pub_dims.load(std::memory_order_relaxed);
+
+        if (vi == 0) {
+            // The RTV path knows exact texture extents; require exact equality
+            // for the display-resolution variant so a slightly-larger pooled
+            // target can never be paired with a smaller tile grid.
+            if (info.width != (uint32_t)(matched_dims >> 32) || info.height != (uint32_t)matched_dims) {
+                return nullptr;
+            }
+
+            // While upscaler render-resolution activity is live, display-res
+            // binds are post-upscale passes - coarse-shading those puts
+            // blockiness straight into the final image.
+            if (m_suppress_fullres.load(std::memory_order_relaxed)) {
+                return nullptr;
+            }
+        }
+
+        const auto sri = variant.sri.load(std::memory_order_acquire);
+
+        // Reject a cross-retarget mismatch: if the dims changed while we loaded
+        // the image, this sri may be scaled for a different resolution.
+        if (sri == nullptr || variant.pub_dims.load(std::memory_order_relaxed) != matched_dims) {
             return nullptr;
         }
 
-        auto& variant = m_variants[vi];
-        const auto sri = variant.sri.load(std::memory_order_seq_cst);
+        variant.binds.fetch_add(1, std::memory_order_relaxed);
 
-        if (sri != nullptr) {
-            variant.binds.fetch_add(1, std::memory_order_relaxed);
+        if (vi == 0 && has_depth) {
+            m_v0_depth_binds.fetch_add(1, std::memory_order_relaxed);
         }
 
         return sri;
     }
 
-    if (m_allow_subres.load(std::memory_order_relaxed) && is_subres_scene_candidate(info.width, info.height)) {
+    // Variant discovery: only from here (true texture extents) and only with a
+    // depth target bound - evidence of a geometry pass at that resolution.
+    if (has_depth && m_allow_subres.load(std::memory_order_relaxed) && is_subres_scene_candidate(info.width, info.height)) {
         request_subres_variant(info.width, info.height);
     }
 
@@ -193,8 +204,9 @@ ID3D12Resource* VRSInjector::match_viewport_bind(const D3D12_VIEWPORT& vp) {
 
     for (size_t i = 0; i < MAX_VARIANTS; ++i) {
         auto& variant = m_variants[i];
-        const auto tw = variant.pub_width.load(std::memory_order_relaxed);
-        const auto th = variant.pub_height.load(std::memory_order_relaxed);
+        const auto packed = variant.pub_dims.load(std::memory_order_relaxed);
+        const auto tw = (uint32_t)(packed >> 32);
+        const auto th = (uint32_t)packed;
 
         if (tw == 0 || th == 0) {
             continue;
@@ -227,32 +239,21 @@ ID3D12Resource* VRSInjector::match_viewport_bind(const D3D12_VIEWPORT& vp) {
             return nullptr;
         }
 
-        const auto sri = variant.sri.load(std::memory_order_seq_cst);
+        const auto sri = variant.sri.load(std::memory_order_acquire);
 
-        if (sri != nullptr) {
-            variant.binds.fetch_add(1, std::memory_order_relaxed);
+        // Reject a cross-retarget mismatch (see match_rtv_bind).
+        if (sri == nullptr || variant.pub_dims.load(std::memory_order_relaxed) != packed) {
+            return nullptr;
         }
 
+        variant.binds.fetch_add(1, std::memory_order_relaxed);
         return sri;
     }
 
-    // Nothing published for these dims - is this an upscaler render resolution
-    // we should build a variant for? Derive the target dims from the viewport
-    // (a per-eye viewport into a sub-resolution double-wide implies a target
-    // twice its width).
-    if (m_allow_subres.load(std::memory_order_relaxed) && is_subres_scene_candidate(vw, vh)) {
-        const auto pw = m_match_width.load(std::memory_order_relaxed);
-        const auto ph = m_match_height.load(std::memory_order_relaxed);
-        const float sy = ph != 0 ? (float)vh / (float)ph : 0.0f;
-        const float sx_full = pw != 0 ? (float)vw / (float)pw : 0.0f;
-
-        if (std::fabs(sx_full - sy) <= 0.015f) {
-            request_subres_variant(vw, vh);
-        } else {
-            request_subres_variant(vw * 2, vh);
-        }
-    }
-
+    // No variant discovery from viewports: dims alone can't distinguish an
+    // upscaler render resolution from a game's own fixed reduced-res pass
+    // (separate translucency, water, scene captures). The RTV+depth path owns
+    // discovery; this path only serves already-published variants.
     return nullptr;
 }
 
@@ -469,8 +470,7 @@ bool pattern_equivalent(const VRSInjector::FoveationDesc& a, const VRSInjector::
 
 void VRSInjector::unpublish_variant(Variant& variant) {
     variant.sri.store(nullptr, std::memory_order_seq_cst);
-    variant.pub_width.store(0, std::memory_order_relaxed);
-    variant.pub_height.store(0, std::memory_order_relaxed);
+    variant.pub_dims.store(0, std::memory_order_relaxed);
 }
 
 void VRSInjector::deactivate() {
@@ -490,9 +490,11 @@ void VRSInjector::deactivate() {
 
 void VRSInjector::retire(Microsoft::WRL::ComPtr<ID3D12Resource> resource) {
     if (resource != nullptr) {
-        // Held for a handful of updates so any command list recorded against the
-        // old image has long been submitted and retired by the GPU.
-        m_retired.emplace_back(8u, std::move(resource));
+        // Held for a generous number of present-thread updates so any command
+        // list recorded against the old image has long been submitted and
+        // retired by the GPU (updates only advance while frames are flowing, so
+        // a stalled game cannot age this out prematurely).
+        m_retired.emplace_back(16u, std::move(resource));
     }
 }
 
@@ -640,9 +642,9 @@ void VRSInjector::update(const FoveationDesc& desc) {
             }
         }
 
+        const auto want_dims = ((uint64_t)variant.target_width << 32) | (uint64_t)variant.target_height;
         const bool published = variant.sri.load(std::memory_order_relaxed) != nullptr &&
-            variant.pub_width.load(std::memory_order_relaxed) == variant.target_width &&
-            variant.pub_height.load(std::memory_order_relaxed) == variant.target_height;
+            variant.pub_dims.load(std::memory_order_relaxed) == want_dims;
 
         if (!published || variant.pattern_serial != m_pattern_serial) {
             if (generate_and_upload(device, desc, variant)) {
@@ -670,8 +672,13 @@ void VRSInjector::update(const FoveationDesc& desc) {
 
     // Suppress display-resolution binds while upscaler render-resolution scene
     // activity is live (those binds are post-upscale passes), with a linger so
-    // per-frame pass ordering jitter doesn't flap the state.
-    if (subres_binds > 0) {
+    // per-frame pass ordering jitter doesn't flap the state. Depth-bound binds
+    // at the display resolution are proof the game still renders real geometry
+    // full-res (i.e. the sub-res activity is the game's own reduced-res pass,
+    // like separate translucency - NOT an upscaler), so they veto suppression.
+    const auto v0_depth_binds = m_v0_depth_binds.exchange(0, std::memory_order_relaxed);
+
+    if (subres_binds > 0 && v0_depth_binds == 0) {
         m_suppress_countdown = SUPPRESS_LINGER_UPDATES;
     } else if (m_suppress_countdown > 0) {
         --m_suppress_countdown;
@@ -695,12 +702,16 @@ bool VRSInjector::generate_and_upload(ID3D12Device* device, const FoveationDesc&
     const bool is_subres = &variant != &m_variants[0];
 
     const auto tile = m_caps.tile_size;
-    // Sub-resolution targets are sometimes viewport-derived, so their true
-    // texture extent may be a pixel or two larger; a margin tile keeps the SRI
-    // at least as large as the target's tile grid (required by the API). Tiles
-    // past the real edge simply never apply.
-    const uint32_t sri_w = (target_w + tile - 1) / tile + (is_subres ? 1 : 0);
-    const uint32_t sri_h = (target_h + tile - 1) / tile + (is_subres ? 1 : 0);
+    // The viewport path can bind this SRI to a render target that is slightly
+    // larger than the matched viewport (pooled/padded targets), so pad the tile
+    // grid to cover the full matching tolerance - an SRI larger than the target
+    // is fine, one smaller than its tile grid is undefined behavior. Tiles past
+    // the real edge simply never apply.
+    (void)is_subres;
+    const uint32_t w_margin_px = 2 + target_w / 200;
+    const uint32_t h_margin_px = 2 + target_h / 200;
+    const uint32_t sri_w = (target_w + w_margin_px + tile - 1) / tile + 1;
+    const uint32_t sri_h = (target_h + h_margin_px + tile - 1) / tile + 1;
 
     const size_t slot_index = variant.ring_index;
     variant.ring_index = (variant.ring_index + 1) % SRI_RING_SIZE;
@@ -900,10 +911,11 @@ bool VRSInjector::generate_and_upload(ID3D12Device* device, const FoveationDesc&
     slot.in_shading_rate_state = true;
     ++m_sri_updates;
 
-    // Publish. Command lists recorded from now on use the new image; ones in
-    // flight keep referencing an older ring slot, which stays alive.
-    variant.pub_width.store(target_w, std::memory_order_relaxed);
-    variant.pub_height.store(target_h, std::memory_order_relaxed);
+    // Publish, dims first then the image (matchers load dims, then sri, then
+    // re-check dims - so a torn pairing is always rejected). Command lists
+    // recorded from now on use the new image; ones in flight keep referencing
+    // an older ring slot, which stays alive.
+    variant.pub_dims.store(((uint64_t)target_w << 32) | (uint64_t)target_h, std::memory_order_relaxed);
     variant.sri.store(slot.texture.Get(), std::memory_order_release);
 
     return true;
@@ -962,6 +974,7 @@ void VRSInjector::on_device_reset() {
 
     m_retired.clear();
     m_subres_request.store(0, std::memory_order_relaxed);
+    m_v0_depth_binds.store(0, std::memory_order_relaxed);
     m_caps = Caps{};
     m_caps_device = nullptr;
     m_has_last_desc = false;

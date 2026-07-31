@@ -1528,8 +1528,11 @@ void VR::update_hmd_state(bool from_view_extensions, uint32_t frame_count) {
 
     // Re-assert stompable cvars on a coarse cadence instead of every frame -
     // games that reset them (menus, scalability reloads) recover within ~0.3s
-    // and the steady-state per-frame lookups/writes disappear.
-    const bool reassert_cvars = (m_cvar_reassert_tick++ % 30) == 0;
+    // and the steady-state per-frame lookups/writes disappear. The cadence is
+    // ODD on purpose: the AFR motion-blur write below only runs on even frame
+    // counts, and tick/frame advance in lockstep, so an even cadence would land
+    // on a fixed frame parity and could starve that branch forever.
+    const bool reassert_cvars = (m_cvar_reassert_tick++ % 31) == 0;
 
     if (m_uncap_framerate->value() && reassert_cvars) {
         sdk::set_cvar_data_float(L"Engine", L"t.MaxFPS", 500.0f);

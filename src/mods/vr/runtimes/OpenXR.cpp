@@ -554,8 +554,6 @@ VRRuntime::Error OpenXR::update_matrices(float nearz, float farz) {
             this->display_projections[eye][k] = std::fabs(raw) <= std::fabs(lim) ? raw : lim;
         }
 
-        this->fov_scale_active = fov_scale_x < 0.999f || fov_scale_y < 0.999f;
-
         view_bounds[eye][0] = 0.5f - 0.5f * this->display_projections[eye][0] / tan_half_fov[0];
         view_bounds[eye][1] = 0.5f + 0.5f * this->display_projections[eye][1] / tan_half_fov[1];
         view_bounds[eye][2] = 0.5f - 0.5f * this->display_projections[eye][2] / tan_half_fov[2];
@@ -618,6 +616,16 @@ VRRuntime::Error OpenXR::update_matrices(float nearz, float farz) {
         this->raw_projections[1][3] = tan(right_fov.angleDown);
         this->projections[0] = get_mat(0);
         this->projections[1] = get_mat(1);
+
+        // Flip the submit-side flag only after BOTH eyes' display_projections are
+        // valid, so end_frame can never pair the flag with a half-initialized set.
+        {
+            const auto& vr = VR::get();
+            const float fsx = std::clamp(vr->get_fov_scale_x(), 0.5f, 1.0f);
+            const float fsy = std::clamp(vr->get_fov_scale_y(), 0.5f, 1.0f);
+            this->fov_scale_active = fsx < 0.999f || fsy < 0.999f;
+        }
+
         this->should_recalculate_eye_projections = false;
         this->last_eye_matrix_nearz = nearz;
     }

@@ -132,8 +132,9 @@ private:
     // A sub-resolution variant with no binds for this many updates is unpublished.
     static constexpr uint32_t VARIANT_IDLE_UPDATES = 300;
     // Display-resolution suppression lingers this many updates past the last
-    // sub-resolution bind, riding out per-frame pass ordering jitter.
-    static constexpr uint32_t SUPPRESS_LINGER_UPDATES = 120;
+    // sub-resolution bind, riding out per-frame pass ordering jitter. Kept short
+    // so a misdetection self-heals quickly.
+    static constexpr uint32_t SUPPRESS_LINGER_UPDATES = 30;
 
     struct RtvInfo {
         ID3D12Resource* resource{};
@@ -151,9 +152,11 @@ private:
 
     struct Variant {
         // Hot-path published state (recording threads only read these).
+        // Dimensions are packed ((w << 32) | h) so readers can never see a torn
+        // width/height pair; matchers re-load them after loading sri to reject
+        // a cross-retarget (dims, sri) mismatch.
         std::atomic<ID3D12Resource*> sri{nullptr};
-        std::atomic<uint32_t> pub_width{0};
-        std::atomic<uint32_t> pub_height{0};
+        std::atomic<uint64_t> pub_dims{0};
         mutable std::atomic<uint32_t> binds{0};
 
         // Update-thread state.
@@ -184,8 +187,11 @@ private:
     // tolerance). Returns the variant index or -1.
     int find_variant_for_target(uint32_t w, uint32_t h) const;
 
-    // True if (w, h) looks like an aspect-preserving upscaler render resolution
-    // of the scene target (full-frame or single-eye of a double-wide).
+    // True if full-target dims (w, h) look like an aspect-preserving upscaler
+    // render resolution of the scene target. Only the RTV path (which sees true
+    // texture extents, with depth bound) may request variants from this - the
+    // viewport path can't distinguish upscaler scene passes from a game's own
+    // fixed reduced-resolution passes reliably enough.
     bool is_subres_scene_candidate(uint32_t w, uint32_t h) const;
 
     // Publish a request for a sub-resolution variant; the present thread
@@ -226,6 +232,11 @@ private:
     // Stats (relaxed atomics, reset each update()).
     mutable std::atomic<uint32_t> m_stat_rtv_binds{0};
     mutable std::atomic<uint32_t> m_stat_vrs_binds{0};
+    // Display-resolution geometry evidence: successful variant-0 binds that had
+    // a depth target bound. If these are present, sub-resolution activity is a
+    // game's own reduced-res pass (translucency/reflections), NOT an upscaler -
+    // so display-res suppression must not arm.
+    mutable std::atomic<uint32_t> m_v0_depth_binds{0};
     Stats m_last_stats{};
 
     // RTV descriptor -> resource info map.

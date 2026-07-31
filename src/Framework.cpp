@@ -638,13 +638,14 @@ void Framework::on_frame_d3d12() {
     }
 
     // Skip the whole overlay render pass (clear + two draw submissions + barriers)
-    // when ImGui produced no geometry this frame and no plugin draws into the
-    // framework RT. The FRAMEWORK_UI swapchain copy is already gated on
-    // is_drawing_anything(), and the next frame with content clears first, so
-    // stale RT contents can never be composited.
+    // when ImGui produced no geometry this frame, nothing is being drawn to the
+    // headset overlay, and no plugin draws into the framework RT. The
+    // is_drawing_anything() term keeps this gate aligned with the FRAMEWORK_UI
+    // swapchain copy in D3D12Component (same condition), so a stale RT can never
+    // be composited: whenever the copy runs, this pass rendered (and cleared).
     const auto pre_draw_data = ImGui::GetDrawData();
     const bool overlay_has_content = pre_draw_data != nullptr &&
-        (pre_draw_data->TotalVtxCount > 0 || PluginLoader::get()->has_dx12_render_callbacks());
+        (pre_draw_data->TotalVtxCount > 0 || is_drawing_anything() || PluginLoader::get()->has_dx12_render_callbacks());
 
     if (!overlay_has_content) {
         if (is_init_ok) {
