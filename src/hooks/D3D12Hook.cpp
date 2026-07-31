@@ -30,7 +30,7 @@ void add_unique_pointer_hook(
     size_t vtable_index,
     void* detour,
     std::vector<std::unique_ptr<PointerHook>>& storage,
-    std::unordered_map<uintptr_t, PointerHook*>& lookup,
+    std::vector<std::pair<uintptr_t, PointerHook*>>& lookup,
     std::unordered_set<uintptr_t>& seen_slots
 ) {
     if (iface == nullptr) {
@@ -45,7 +45,7 @@ void add_unique_pointer_hook(
     }
 
     auto hook = std::make_unique<PointerHook>(slot, detour);
-    lookup.emplace(slot_key, hook.get());
+    lookup.emplace_back(slot_key, hook.get());
     storage.emplace_back(std::move(hook));
 }
 }
@@ -561,28 +561,35 @@ bool D3D12Hook::unhook() {
     return true;
 }
 
-PointerHook* D3D12Hook::find_create_render_target_view_hook(void* slot) const {
-    if (const auto it = m_create_render_target_view_hook_lookup.find(reinterpret_cast<uintptr_t>(slot)); it != m_create_render_target_view_hook_lookup.end()) {
-        return it->second;
+namespace {
+// 1-3 entries in practice: a linear scan beats hashing on the hot dispatch path.
+PointerHook* find_hook_for_slot(
+    const std::vector<std::pair<uintptr_t, PointerHook*>>& lookup,
+    const std::vector<std::unique_ptr<PointerHook>>& storage,
+    void* slot)
+{
+    const auto slot_key = reinterpret_cast<uintptr_t>(slot);
+
+    for (const auto& [key, hook] : lookup) {
+        if (key == slot_key) {
+            return hook;
+        }
     }
 
-    return m_create_render_target_view_hooks.empty() ? nullptr : m_create_render_target_view_hooks.front().get();
+    return storage.empty() ? nullptr : storage.front().get();
+}
+}
+
+PointerHook* D3D12Hook::find_create_render_target_view_hook(void* slot) const {
+    return find_hook_for_slot(m_create_render_target_view_hook_lookup, m_create_render_target_view_hooks, slot);
 }
 
 PointerHook* D3D12Hook::find_om_set_render_targets_hook(void* slot) const {
-    if (const auto it = m_om_set_render_targets_hook_lookup.find(reinterpret_cast<uintptr_t>(slot)); it != m_om_set_render_targets_hook_lookup.end()) {
-        return it->second;
-    }
-
-    return m_om_set_render_targets_hooks.empty() ? nullptr : m_om_set_render_targets_hooks.front().get();
+    return find_hook_for_slot(m_om_set_render_targets_hook_lookup, m_om_set_render_targets_hooks, slot);
 }
 
 PointerHook* D3D12Hook::find_rs_set_viewports_hook(void* slot) const {
-    if (const auto it = m_rs_set_viewports_hook_lookup.find(reinterpret_cast<uintptr_t>(slot)); it != m_rs_set_viewports_hook_lookup.end()) {
-        return it->second;
-    }
-
-    return m_rs_set_viewports_hooks.empty() ? nullptr : m_rs_set_viewports_hooks.front().get();
+    return find_hook_for_slot(m_rs_set_viewports_hook_lookup, m_rs_set_viewports_hooks, slot);
 }
 
 void WINAPI D3D12Hook::create_render_target_view(

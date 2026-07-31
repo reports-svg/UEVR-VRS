@@ -2,6 +2,7 @@
 
 #include <iostream>
 #include <functional>
+#include <utility>
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -131,13 +132,15 @@ protected:
     std::unique_ptr<PointerHook> m_present1_hook{};
     // VRS foveated rendering: hooks on the D3D12 device/command-list vtables so the
     // VRSInjector can track RTV creation and scene passes (one hook per unique
-    // vtable slot across the QI'd interface hierarchy).
+    // vtable slot across the QI'd interface hierarchy). Lookups are tiny (1-3
+    // entries) and hit on every RSSetViewports/OMSetRenderTargets in the game,
+    // so they are flat slot->hook vectors scanned linearly, not hash maps.
     std::vector<std::unique_ptr<PointerHook>> m_create_render_target_view_hooks{};
     std::vector<std::unique_ptr<PointerHook>> m_om_set_render_targets_hooks{};
     std::vector<std::unique_ptr<PointerHook>> m_rs_set_viewports_hooks{};
-    std::unordered_map<uintptr_t, PointerHook*> m_create_render_target_view_hook_lookup{};
-    std::unordered_map<uintptr_t, PointerHook*> m_om_set_render_targets_hook_lookup{};
-    std::unordered_map<uintptr_t, PointerHook*> m_rs_set_viewports_hook_lookup{};
+    std::vector<std::pair<uintptr_t, PointerHook*>> m_create_render_target_view_hook_lookup{};
+    std::vector<std::pair<uintptr_t, PointerHook*>> m_om_set_render_targets_hook_lookup{};
+    std::vector<std::pair<uintptr_t, PointerHook*>> m_rs_set_viewports_hook_lookup{};
     std::unique_ptr<VtableHook> m_swapchain_hook{};
     //std::unique_ptr<FunctionHook> m_create_swap_chain_hook{};
 

@@ -653,6 +653,14 @@ public:
         return m_grow_rectangle_for_projection_cropping->value();
     }
 
+    float get_fov_scale_x() const {
+        return m_fov_scale_x->value();
+    }
+
+    float get_fov_scale_y() const {
+        return m_fov_scale_y->value();
+    }
+
     vrmod::D3D11Component& d3d11() {
         return m_d3d11;
     }
@@ -920,6 +928,13 @@ private:
     const ModCombo::Ptr m_horizontal_projection_override{ModCombo::create(generate_name("HorizontalProjectionOverride"), s_horizontal_projection_override_names)};
     const ModCombo::Ptr m_vertical_projection_override{ModCombo::create(generate_name("VerticalProjectionOverride"), s_vertical_projection_override_names)};
     const ModToggle::Ptr m_grow_rectangle_for_projection_cropping{ModToggle::create(generate_name("GrowRectangleForProjectionCropping"), false)};
+    // Tangent-space FOV scale (OpenXR only). Values < 1 shrink the rendered and
+    // displayed frustum together, so the render target itself gets smaller at
+    // constant center pixel density - pixel cost falls with the product of the
+    // two scales. The outermost degrees are the most pixel-expensive (planar
+    // projection ~ tan), so 0.85x costs only a few degrees of visible FOV.
+    const ModSlider::Ptr m_fov_scale_x{ModSlider::create(generate_name("FOVScaleX"), 0.50f, 1.00f, 1.00f)};
+    const ModSlider::Ptr m_fov_scale_y{ModSlider::create(generate_name("FOVScaleY"), 0.50f, 1.00f, 1.00f)};
     const ModCombo::Ptr m_sync_mode{ ModCombo::create(generate_name("SynchronizationMode"), s_sync_mode_names, 2) };
 
     // Snap turn settings and globals
@@ -1066,6 +1081,8 @@ public:
             *m_horizontal_projection_override,
             *m_vertical_projection_override,
             *m_grow_rectangle_for_projection_cropping,
+            *m_fov_scale_x,
+            *m_fov_scale_y,
             *m_snapturn,
             *m_snapturn_joystick_deadzone,
             *m_snapturn_angle,
@@ -1146,6 +1163,9 @@ private:
     // == 1 or == 0
     uint8_t m_left_eye_interval{0};
     uint8_t m_right_eye_interval{1};
+
+    // Cadence counter for re-asserting stompable cvars (see update_hmd_state).
+    uint32_t m_cvar_reassert_tick{0};
 
     bool m_first_config_load{true};
     bool m_first_submit{true};

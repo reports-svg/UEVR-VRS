@@ -1,6 +1,10 @@
 #pragma once
 
 #include <mutex>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <unordered_set>
 #include <wrl.h>
 
 #include "../../Mod.hpp"
@@ -23,7 +27,7 @@ public:
         m_wants_activate = true;
     }
 
-    IPooledRenderTarget* get_render_target(const std::wstring& name) {
+    IPooledRenderTarget* get_render_target(std::wstring_view name) {
         std::scoped_lock _{m_mutex};
         if (auto it = m_render_targets.find(name); it != m_render_targets.end()) {
             return it->second;
@@ -33,7 +37,7 @@ public:
     }
 
     template<typename T>
-    Microsoft::WRL::ComPtr<T> get_texture(const std::wstring& name) {
+    Microsoft::WRL::ComPtr<T> get_texture(std::wstring_view name) {
         std::scoped_lock _{m_mutex};
         if (auto it = m_render_targets.find(name); it != m_render_targets.end()) {
             const auto& rt = it->second;
@@ -87,8 +91,18 @@ private:
     bool m_hooked{false};
     bool m_wants_activate{false};
 
+    // Transparent hashing so the per-FindFreeElement lookups (dozens+ per frame
+    // on the render thread when depth submission is on) can key on the raw
+    // wchar_t* without constructing a std::wstring per call.
+    struct TransparentWStrHash {
+        using is_transparent = void;
+        size_t operator()(std::wstring_view s) const noexcept { return std::hash<std::wstring_view>{}(s); }
+        size_t operator()(const std::wstring& s) const noexcept { return std::hash<std::wstring_view>{}(s); }
+        size_t operator()(const wchar_t* s) const noexcept { return std::hash<std::wstring_view>{}(s); }
+    };
+
     std::recursive_mutex m_mutex{};
     SafetyHookInline m_find_free_element_hook{};
-    std::unordered_map<std::wstring, IPooledRenderTarget*> m_render_targets{};
-    std::unordered_set<std::wstring> m_seen_names{};
+    std::unordered_map<std::wstring, IPooledRenderTarget*, TransparentWStrHash, std::equal_to<>> m_render_targets{};
+    std::unordered_set<std::wstring, TransparentWStrHash, std::equal_to<>> m_seen_names{};
 };

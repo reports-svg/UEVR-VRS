@@ -1525,12 +1525,18 @@ void VR::update_hmd_state(bool from_view_extensions, uint32_t frame_count) {
     std::scoped_lock _{m_reinitialize_mtx};
 
     auto runtime = get_runtime();
-    if (m_uncap_framerate->value()) {
+
+    // Re-assert stompable cvars on a coarse cadence instead of every frame -
+    // games that reset them (menus, scalability reloads) recover within ~0.3s
+    // and the steady-state per-frame lookups/writes disappear.
+    const bool reassert_cvars = (m_cvar_reassert_tick++ % 30) == 0;
+
+    if (m_uncap_framerate->value() && reassert_cvars) {
         sdk::set_cvar_data_float(L"Engine", L"t.MaxFPS", 500.0f);
     }
 
     // Allows games running in HDR mode to not have a black UI overlay
-    if (m_disable_hdr_compositing->value()) {
+    if (m_disable_hdr_compositing->value() && reassert_cvars) {
         sdk::set_cvar_data_int(L"SlateRHIRenderer", L"r.HDR.UI.CompositeMode", 0);
     }
 
@@ -1578,7 +1584,9 @@ void VR::update_hmd_state(bool from_view_extensions, uint32_t frame_count) {
         }
 
         // Forcefully disable motion blur because it freaks out with AFR
-        sdk::set_cvar_data_int(L"Engine", L"r.DefaultFeature.MotionBlur", 0);
+        if (reassert_cvars) {
+            sdk::set_cvar_data_int(L"Engine", L"r.DefaultFeature.MotionBlur", 0);
+        }
         return;
     }
     
@@ -2650,9 +2658,18 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
             const auto horizontal_projection_changed = m_horizontal_projection_override->draw("Horizontal Projection");
             const auto vertical_projection_changed = m_vertical_projection_override->draw("Vertical Projection");
             const auto scale_render = m_grow_rectangle_for_projection_cropping->draw("Scale Render Target");
+            const auto fov_scale_x_changed = m_fov_scale_x->draw("FOV Scale (Horizontal)");
+            const auto fov_scale_y_changed = m_fov_scale_y->draw("FOV Scale (Vertical)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Shrinks the rendered AND displayed FOV together (OpenXR only), so the render target itself\n"
+                    "gets smaller at unchanged center sharpness. Pixel cost scales with the product of the two\n"
+                    "sliders (0.85 x 0.85 = ~28%% fewer pixels for only a few degrees of edge FOV).");
+            }
             const auto scale_render_changed = get_runtime()->is_modifying_eye_texture_scale != scale_render;
             get_runtime()->is_modifying_eye_texture_scale = scale_render;
-            get_runtime()->should_recalculate_eye_projections = horizontal_projection_changed || vertical_projection_changed || scale_render_changed;
+            get_runtime()->should_recalculate_eye_projections = horizontal_projection_changed || vertical_projection_changed ||
+                scale_render_changed || fov_scale_x_changed || fov_scale_y_changed;
 
             ImGui::TreePop();
         }

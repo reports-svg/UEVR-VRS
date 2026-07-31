@@ -96,6 +96,9 @@ private:
     void update_injected_path();
     float update_dynamic_amount();
     void get_ring_cutoffs(float& full_cutoff, float& half_cutoff, float& center_v) const;
+    // Per-eye optical centers (gaze-independent) in per-eye UV space, derived
+    // from the HMD's asymmetric projection when enabled.
+    void compute_optical_centers(float (&center_u)[2], float (&center_v)[2]) const;
     // Returns per-eye foveation centers in per-eye UV space.
     void compute_eye_centers(float (&center_u)[2], float (&center_v)[2], float preset_center_v);
 
@@ -120,11 +123,22 @@ private:
     const ModToggle::Ptr m_dynamic{ ModToggle::create(generate_name("Dynamic"), false) };
     const ModSlider::Ptr m_dynamic_target_ms{ ModSlider::create(generate_name("DynamicTargetMs"), 5.0f, 30.0f, 12.5f) };
     const ModToggle::Ptr m_gaze_tracking{ ModToggle::create(generate_name("GazeTracking"), false) };
-    const ModSlider::Ptr m_gaze_smoothing{ ModSlider::create(generate_name("GazeSmoothing"), 0.0f, 0.95f, 0.6f, true) };
+    // EMA smoothing adds roughly s/(1-s) frames of gaze latency (~17ms at 0.6 and
+    // 90Hz); research puts the total gaze-to-photon budget at 50-70ms, so the
+    // default stays low and heavy smoothing is a deliberate user choice.
+    const ModSlider::Ptr m_gaze_smoothing{ ModSlider::create(generate_name("GazeSmoothing"), 0.0f, 0.95f, 0.4f, true) };
     const ModToggle::Ptr m_engine_preview{ ModToggle::create(generate_name("EnginePreview"), false) };
     const ModToggle::Ptr m_debug_preview{ ModToggle::create(generate_name("DebugPreview"), false) };
     const ModToggle::Ptr m_require_depth{ ModToggle::create(generate_name("InjectedRequireDepth"), true, true) };
     const ModToggle::Ptr m_use_optical_centers{ ModToggle::create(generate_name("UseOpticalCenters"), true, true) };
+    // Upscaler awareness: allow the injector to build shading-rate images for
+    // DLSS/FSR/TSR render resolutions and suppress display-res binds meanwhile.
+    const ModToggle::Ptr m_upscaler_compat{ ModToggle::create(generate_name("UpscalerCompat"), true, true) };
+    // Lens mask: coarsen tiles outside the lens-visible ellipse (anchored at the
+    // optical centers) even when the gaze rings wander toward an edge.
+    const ModToggle::Ptr m_lens_mask{ ModToggle::create(generate_name("LensMask"), true, true) };
+    const ModSlider::Ptr m_lens_scale_x{ ModSlider::create(generate_name("LensMaskScaleX"), 0.70f, 1.50f, 1.05f, true) };
+    const ModSlider::Ptr m_lens_scale_y{ ModSlider::create(generate_name("LensMaskScaleY"), 0.70f, 1.50f, 1.05f, true) };
     const ModSlider::Ptr m_center_offset_x{ ModSlider::create(generate_name("CenterOffsetX"), -0.4f, 0.4f, 0.0f, true) };
     const ModSlider::Ptr m_center_offset_y{ ModSlider::create(generate_name("CenterOffsetY"), -0.4f, 0.4f, 0.0f, true) };
     const ModCombo::Ptr m_layout_override{ ModCombo::create(generate_name("LayoutOverride"),
@@ -149,5 +163,10 @@ private:
         float eye_aspect{1.0f}; // per-eye width/height, for correct ring shape
         float center_u[2]{0.5f, 0.5f};
         float center_v[2]{0.5f, 0.5f};
+        bool lens_mask{false};
+        float lens_u[2]{0.5f, 0.5f};
+        float lens_v[2]{0.5f, 0.5f};
+        float lens_rx{1.05f};
+        float lens_ry{1.05f};
     } m_preview{};
 };

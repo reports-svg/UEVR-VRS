@@ -571,7 +571,12 @@ void CVarManager::CVarStandard::update() {
     ZoneScopedN(__FUNCTION__);
 
     if (m_cvar == nullptr) {
-        m_cvar = sdk::find_cvar_cached(m_module, m_name);
+        if (m_find_backoff == 0) {
+            m_cvar = sdk::find_cvar_cached(m_module, m_name);
+            m_find_backoff = FIND_RETRY_INTERVAL;
+        } else {
+            --m_find_backoff;
+        }
     }
 }
 
@@ -721,7 +726,12 @@ void CVarManager::CVarData::update() {
     ZoneScopedN(__FUNCTION__);
 
     if (!m_cvar_data) {
-        m_cvar_data = sdk::find_cvar_data_cached(m_module, m_name);
+        if (m_find_backoff == 0) {
+            m_cvar_data = sdk::find_cvar_data_cached(m_module, m_name);
+            m_find_backoff = FIND_RETRY_INTERVAL;
+        } else {
+            --m_find_backoff;
+        }
     }
 }
 

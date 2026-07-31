@@ -82,6 +82,10 @@ FoveatedRendering::FoveatedRendering() {
         *m_debug_preview,
         *m_require_depth,
         *m_use_optical_centers,
+        *m_upscaler_compat,
+        *m_lens_mask,
+        *m_lens_scale_x,
+        *m_lens_scale_y,
         *m_center_offset_x,
         *m_center_offset_y,
         *m_layout_override,
@@ -327,14 +331,12 @@ void FoveatedRendering::get_ring_cutoffs(float& full_cutoff, float& half_cutoff,
     center_v = PRESET_CENTER_V[engine_level];
 }
 
-void FoveatedRendering::compute_eye_centers(float (&center_u)[2], float (&center_v)[2], float preset_center_v) {
+void FoveatedRendering::compute_optical_centers(float (&center_u)[2], float (&center_v)[2]) const {
+    // Fixed defaults: middle of each eye.
+    center_u[0] = center_u[1] = 0.5f;
+    center_v[0] = center_v[1] = 0.5f;
+
     auto& vr = VR::get();
-
-    // Fixed defaults: middle of each eye, with the preset's vertical shift and
-    // the user's manual offsets.
-    float base_u[2]{0.5f, 0.5f};
-    float base_v[2]{0.5f, 0.5f};
-
     const auto runtime = vr->get_runtime();
 
     if (m_use_optical_centers->value() && runtime != nullptr && runtime->loaded) {
@@ -350,11 +352,23 @@ void FoveatedRendering::compute_eye_centers(float (&center_u)[2], float (&center
             const float b = std::fabs(raw[3]);
 
             if (l + r > 0.01f && t + b > 0.01f) {
-                base_u[eye] = l / (l + r);
-                base_v[eye] = t / (t + b);
+                center_u[eye] = l / (l + r);
+                center_v[eye] = t / (t + b);
             }
         }
     }
+}
+
+void FoveatedRendering::compute_eye_centers(float (&center_u)[2], float (&center_v)[2], float preset_center_v) {
+    auto& vr = VR::get();
+
+    // Optical centers (or eye-rect middles), plus the preset's vertical shift
+    // and the user's manual offsets.
+    float base_u[2]{0.5f, 0.5f};
+    float base_v[2]{0.5f, 0.5f};
+    compute_optical_centers(base_u, base_v);
+
+    const auto runtime = vr->get_runtime();
 
     bool gaze_applied = false;
 
@@ -505,13 +519,24 @@ void FoveatedRendering::update_injected_path() {
     desc.half_rate_cutoff = half_cutoff;
     desc.allow_4x4 = m_allow_4x4->value();
     desc.require_depth = m_require_depth->value();
+    desc.allow_subres = m_upscaler_compat->value();
 
     float center_u[2]{}, center_v[2]{};
     compute_eye_centers(center_u, center_v, preset_center_v);
 
+    // Lens mask anchors at the pre-gaze optical centers, so it stays put while
+    // the foveation rings follow the eyes.
+    float lens_u[2]{}, lens_v[2]{};
+    compute_optical_centers(lens_u, lens_v);
+    desc.lens_mask = m_lens_mask->value();
+    desc.lens_rx = m_lens_scale_x->value();
+    desc.lens_ry = m_lens_scale_y->value();
+
     for (int eye = 0; eye < 2; ++eye) {
         desc.center_u[eye] = center_u[eye];
         desc.center_v[eye] = center_v[eye];
+        desc.lens_u[eye] = lens_u[eye];
+        desc.lens_v[eye] = lens_v[eye];
     }
 
     // In mono / AFR the scene target holds a single eye per frame and the
@@ -522,6 +547,8 @@ void FoveatedRendering::update_injected_path() {
         const int cur_eye = vr->is_current_frame_left_eye() ? 0 : 1;
         desc.center_u[0] = center_u[cur_eye];
         desc.center_v[0] = center_v[cur_eye];
+        desc.lens_u[0] = lens_u[cur_eye];
+        desc.lens_v[0] = lens_v[cur_eye];
     }
 
     desc.enabled = true;
@@ -541,6 +568,13 @@ void FoveatedRendering::update_injected_path() {
     m_preview.center_v[0] = desc.center_v[0];
     m_preview.center_u[1] = desc.center_u[1];
     m_preview.center_v[1] = desc.center_v[1];
+    m_preview.lens_mask = desc.lens_mask;
+    m_preview.lens_u[0] = desc.lens_u[0];
+    m_preview.lens_v[0] = desc.lens_v[0];
+    m_preview.lens_u[1] = desc.lens_u[1];
+    m_preview.lens_v[1] = desc.lens_v[1];
+    m_preview.lens_rx = desc.lens_rx;
+    m_preview.lens_ry = desc.lens_ry;
 }
 
 void FoveatedRendering::on_frame() {
@@ -569,9 +603,23 @@ int FoveatedRendering::preview_rate_at(float u, float v) const {
     const float r2 = r * r;
     const float d2 = 4.0f * (du * du * r2 + dv * dv) / (r2 + 1.0f);
 
+    const int outer = p.allow_4x4 ? 2 : 1;
+
     if (d2 > p.half_cutoff_sq) {
-        return p.allow_4x4 ? 2 : 1;
+        return outer;
     }
+
+    // Lens-mask ellipse in the same per-eye UV space as the generator
+    // (ldx = du_px / (rx * eye_w/2) reduces to 2*du/rx in UV).
+    if (p.lens_mask && p.lens_rx > 0.01f && p.lens_ry > 0.01f) {
+        const float ldx = 2.0f * (eu - p.lens_u[eye]) / p.lens_rx;
+        const float ldy = 2.0f * (ev - p.lens_v[eye]) / p.lens_ry;
+
+        if (ldx * ldx + ldy * ldy > 1.0f) {
+            return outer;
+        }
+    }
+
     if (d2 > p.full_cutoff_sq) {
         return 1;
     }
@@ -794,6 +842,23 @@ void FoveatedRendering::on_draw_ui() {
             help_marker(
                 "Places each eye's fovea at the true optical center derived from the HMD's asymmetric "
                 "projection, instead of the middle of the eye rect.");
+            m_upscaler_compat->draw("Upscaler Compatibility (DLSS/FSR/TSR)");
+            help_marker(
+                "When the game renders internally at a reduced resolution (DLSS/FSR2/TSR/ScreenPercentage), "
+                "build correctly-scaled shading-rate images for that resolution and stop touching "
+                "display-resolution passes (which are post-upscale). Leave on unless it misdetects passes.");
+            m_lens_mask->draw("Lens Mask (Coarsen Invisible Corners)");
+            help_marker(
+                "Forces tiles outside an ellipse anchored at each eye's optical center to the coarsest rate. "
+                "Headset lenses cannot resolve the corners of the rendered rectangle, so this is nearly free "
+                "performance - it mostly matters with eye tracking, when the gaze rings wander toward an edge. "
+                "Tune the ellipse with the sliders below while watching the Debug Preview.");
+
+            if (m_lens_mask->value()) {
+                m_lens_scale_x->draw("Lens Mask Width");
+                m_lens_scale_y->draw("Lens Mask Height");
+            }
+
             m_center_offset_x->draw("Center Offset X");
             m_center_offset_y->draw("Center Offset Y");
             m_layout_override->draw("Stereo Layout");
@@ -816,6 +881,12 @@ void FoveatedRendering::on_draw_ui() {
             ImGui::Text("Tile size: %u | Additional rates (4x4): %s", caps.tile_size, caps.additional_rates ? "yes" : "no");
             ImGui::Text("Shading-rate image: %ux%u | updates: %u", stats.sri_width, stats.sri_height, stats.sri_updates);
             ImGui::Text("RT binds seen/frame: %u | VRS binds applied/frame: %u", stats.rtv_binds, stats.vrs_binds);
+
+            if (stats.subres_width != 0) {
+                ImGui::Text("Upscaler render res: %ux%u | binds/frame: %u%s",
+                    stats.subres_width, stats.subres_height, stats.subres_binds,
+                    stats.suppressing_fullres ? " (display-res passes excluded)" : "");
+            }
 
             if (stats.active && stats.vrs_binds == 0) {
                 ImGui::TextWrapped(

@@ -385,7 +385,10 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                     m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::UI, m_2d_screen_tex[0].texture.Get(), draw_2d_view, std::nullopt, ENGINE_SRC_COLOR);
                     m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::UI_RIGHT, m_2d_screen_tex[1].texture.Get(), std::nullopt, clear_rt, ENGINE_SRC_COLOR);
                 }
-            } else if (ui_target != nullptr) {
+            } else if (ui_target != nullptr && vr->is_gui_enabled()) {
+                // The UI quad layer isn't submitted while the GUI is hidden
+                // (OverlayComponent returns nullopt), so skip the UI-resolution
+                // copy + clear too; the copy resumes the frame the GUI comes back.
                 m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::UI, (ID3D12Resource*)ui_target->get_native_resource(), draw_2d_view, clear_rt, ENGINE_SRC_COLOR);
             }
 

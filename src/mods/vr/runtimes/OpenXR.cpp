@@ -1,6 +1,8 @@
 #include <Windows.h>
 #include <TlHelp32.h>
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 
@@ -532,10 +534,32 @@ VRRuntime::Error OpenXR::update_matrices(float nearz, float farz) {
             tan_half_fov[2] = this->raw_projections[eye][2];
             tan_half_fov[3] = this->raw_projections[eye][3];
         }
-        view_bounds[eye][0] = 0.5f - 0.5f * this->raw_projections[eye][0] / tan_half_fov[0];
-        view_bounds[eye][1] = 0.5f + 0.5f * this->raw_projections[eye][1] / tan_half_fov[1];
-        view_bounds[eye][2] = 0.5f - 0.5f * this->raw_projections[eye][2] / tan_half_fov[2];
-        view_bounds[eye][3] = 0.5f + 0.5f * this->raw_projections[eye][3] / tan_half_fov[3];
+
+        // FOV scale: shrink the rendered frustum in tangent space. The displayed
+        // FOV shrinks with it (see display_projections below + end_frame), so
+        // unlike the overrides above this genuinely reduces rendered pixels via
+        // the eye_*_adjustment factors at the bottom of this lambda.
+        const float fov_scale_x = std::clamp(vr->get_fov_scale_x(), 0.5f, 1.0f);
+        const float fov_scale_y = std::clamp(vr->get_fov_scale_y(), 0.5f, 1.0f);
+        tan_half_fov[0] *= fov_scale_x;
+        tan_half_fov[1] *= fov_scale_x;
+        tan_half_fov[2] *= fov_scale_y;
+        tan_half_fov[3] *= fov_scale_y;
+
+        // The tangents actually displayed: the raw frustum clipped to what we
+        // render. With no overrides and scale = 1 this is exactly the raw FOV.
+        for (int k = 0; k < 4; ++k) {
+            const float raw = this->raw_projections[eye][k];
+            const float lim = tan_half_fov[k];
+            this->display_projections[eye][k] = std::fabs(raw) <= std::fabs(lim) ? raw : lim;
+        }
+
+        this->fov_scale_active = fov_scale_x < 0.999f || fov_scale_y < 0.999f;
+
+        view_bounds[eye][0] = 0.5f - 0.5f * this->display_projections[eye][0] / tan_half_fov[0];
+        view_bounds[eye][1] = 0.5f + 0.5f * this->display_projections[eye][1] / tan_half_fov[1];
+        view_bounds[eye][2] = 0.5f - 0.5f * this->display_projections[eye][2] / tan_half_fov[2];
+        view_bounds[eye][3] = 0.5f + 0.5f * this->display_projections[eye][3] / tan_half_fov[3];
 
         // if we've derived the right eye, we have up to date view bounds for both so adjust the render target if necessary
         if (eye == 1) {
@@ -546,6 +570,11 @@ VRRuntime::Error OpenXR::update_matrices(float nearz, float farz) {
                 eye_width_adjustment = 1;
                 eye_height_adjustment = 1;
             }
+
+            // The narrowed frustum needs proportionally fewer pixels for the
+            // same center pixel density - shrink the render target with it.
+            eye_width_adjustment *= fov_scale_x;
+            eye_height_adjustment *= fov_scale_y;
             SPDLOG_INFO("Eye texture proportion scale: {} by {}", eye_width_adjustment, eye_height_adjustment);
         }
 
@@ -1878,7 +1907,18 @@ XrResult OpenXR::end_frame(const std::vector<XrCompositionLayerBaseHeader*>& qua
 
             projection_layer_views[i].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
             projection_layer_views[i].pose = pipelined_stage_views[i].pose;
-            projection_layer_views[i].fov = pipelined_stage_views[i].fov;
+
+            if (this->fov_scale_active) {
+                // FOV scale renders a narrowed frustum; declare exactly what was
+                // rendered so the compositor shows it at the correct angular size.
+                projection_layer_views[i].fov.angleLeft = std::atan(this->display_projections[i][0]);
+                projection_layer_views[i].fov.angleRight = std::atan(this->display_projections[i][1]);
+                projection_layer_views[i].fov.angleUp = std::atan(this->display_projections[i][2]);
+                projection_layer_views[i].fov.angleDown = std::atan(this->display_projections[i][3]);
+            } else {
+                projection_layer_views[i].fov = pipelined_stage_views[i].fov;
+            }
+
             projection_layer_views[i].subImage.swapchain = swapchain->handle;
 
             int32_t offset_x = 0, offset_y = 0, extent_x = 0, extent_y = 0;

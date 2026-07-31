@@ -63,26 +63,77 @@ void VRSInjector::register_rtv(ID3D12Resource* resource, D3D12_CPU_DESCRIPTOR_HA
     }
 }
 
-bool VRSInjector::matches_scene_target(
+int VRSInjector::find_variant_for_target(uint32_t w, uint32_t h) const {
+    for (size_t i = 0; i < MAX_VARIANTS; ++i) {
+        const auto vw = m_variants[i].pub_width.load(std::memory_order_relaxed);
+        const auto vh = m_variants[i].pub_height.load(std::memory_order_relaxed);
+
+        if (vw == 0 || vh == 0) {
+            continue;
+        }
+
+        const uint32_t w_tol = 2 + vw / 200;
+        const uint32_t h_tol = 2 + vh / 200;
+
+        if (w + w_tol >= vw && w <= vw + w_tol && h + h_tol >= vh && h <= vh + h_tol) {
+            return (int)i;
+        }
+    }
+
+    return -1;
+}
+
+bool VRSInjector::is_subres_scene_candidate(uint32_t w, uint32_t h) const {
+    const auto pw = m_match_width.load(std::memory_order_relaxed);
+    const auto ph = m_match_height.load(std::memory_order_relaxed);
+
+    if (pw == 0 || ph == 0 || w == 0 || h == 0 || h >= ph) {
+        return false;
+    }
+
+    const float sy = (float)h / (float)ph;
+
+    // Floor of 0.51 keeps the half-resolution bloom/SSR chains (0.5x) out while
+    // accepting DLSS/FSR Quality (0.667) and Balanced (0.58); ceiling of 0.97
+    // keeps a clean separation from the display-resolution variant's tolerance.
+    if (sy < 0.51f || sy > 0.97f) {
+        return false;
+    }
+
+    const float sx_full = (float)w / (float)pw;
+
+    if (std::fabs(sx_full - sy) <= 0.015f) {
+        return true;
+    }
+
+    if (m_double_wide.load(std::memory_order_relaxed)) {
+        const float sx_half = (float)w / ((float)pw * 0.5f);
+
+        if (std::fabs(sx_half - sy) <= 0.015f) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+void VRSInjector::request_subres_variant(uint32_t w, uint32_t h) {
+    m_subres_request.store(((uint64_t)w << 32) | (uint64_t)h, std::memory_order_relaxed);
+}
+
+ID3D12Resource* VRSInjector::match_rtv_bind(
     UINT num_render_targets,
     const D3D12_CPU_DESCRIPTOR_HANDLE* render_targets,
-    const D3D12_CPU_DESCRIPTOR_HANDLE* depth_stencil) const
+    const D3D12_CPU_DESCRIPTOR_HANDLE* depth_stencil)
 {
     if (num_render_targets == 0 || render_targets == nullptr || render_targets[0].ptr == 0) {
-        return false;
+        return nullptr;
     }
 
     if (m_require_depth.load(std::memory_order_relaxed)) {
         if (depth_stencil == nullptr || depth_stencil->ptr == 0) {
-            return false;
+            return nullptr;
         }
-    }
-
-    const auto match_w = m_match_width.load(std::memory_order_relaxed);
-    const auto match_h = m_match_height.load(std::memory_order_relaxed);
-
-    if (match_w == 0 || match_h == 0) {
-        return false;
     }
 
     RtvInfo info{};
@@ -92,21 +143,117 @@ bool VRSInjector::matches_scene_target(
         const auto it = m_rtv_map.find(render_targets[0].ptr);
 
         if (it == m_rtv_map.end()) {
-            return false;
+            return nullptr;
         }
 
         info = it->second;
     }
 
-    if (info.width != match_w || info.height != match_h) {
-        return false;
-    }
-
     if ((uintptr_t)info.resource == m_excluded_resource.load(std::memory_order_relaxed)) {
-        return false;
+        return nullptr;
     }
 
-    return true;
+    const auto vi = find_variant_for_target(info.width, info.height);
+
+    if (vi >= 0) {
+        // While upscaler render-resolution activity is live, display-resolution
+        // binds are post-upscale passes - coarse-shading those puts blockiness
+        // straight into the final image with no temporal filter behind it.
+        if (vi == 0 && m_suppress_fullres.load(std::memory_order_relaxed)) {
+            return nullptr;
+        }
+
+        auto& variant = m_variants[vi];
+        const auto sri = variant.sri.load(std::memory_order_seq_cst);
+
+        if (sri != nullptr) {
+            variant.binds.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        return sri;
+    }
+
+    if (m_allow_subres.load(std::memory_order_relaxed) && is_subres_scene_candidate(info.width, info.height)) {
+        request_subres_variant(info.width, info.height);
+    }
+
+    return nullptr;
+}
+
+ID3D12Resource* VRSInjector::match_viewport_bind(const D3D12_VIEWPORT& vp) {
+    const uint32_t vw = (uint32_t)(vp.Width + 0.5f);
+    const uint32_t vh = (uint32_t)(vp.Height + 0.5f);
+
+    if (vw == 0 || vh == 0) {
+        return nullptr;
+    }
+
+    const bool double_wide = m_double_wide.load(std::memory_order_relaxed);
+    const bool suppress_fullres = m_suppress_fullres.load(std::memory_order_relaxed);
+
+    for (size_t i = 0; i < MAX_VARIANTS; ++i) {
+        auto& variant = m_variants[i];
+        const auto tw = variant.pub_width.load(std::memory_order_relaxed);
+        const auto th = variant.pub_height.load(std::memory_order_relaxed);
+
+        if (tw == 0 || th == 0) {
+            continue;
+        }
+
+        // Height must line up with the target; small offscreen passes (shadow
+        // maps, reflection captures, downsampled post) won't.
+        const uint32_t h_tol = 2 + th / 200; // ~0.5% tolerance
+        if (vh + h_tol < th || vh > th + h_tol) {
+            continue;
+        }
+
+        const uint32_t w_tol = 2 + tw / 200;
+
+        // Full-frame draw (both eyes in a double-wide target, or a mono target),
+        // or a single-eye viewport into a double-wide target. The SRI is
+        // full-width and maps 1:1 to the bound RT regardless of the viewport.
+        bool matched = (vw + w_tol >= tw && vw <= tw + w_tol);
+
+        if (!matched && double_wide) {
+            const uint32_t half = tw / 2;
+            matched = (vw + w_tol >= half && vw <= half + w_tol);
+        }
+
+        if (!matched) {
+            continue;
+        }
+
+        if (i == 0 && suppress_fullres) {
+            return nullptr;
+        }
+
+        const auto sri = variant.sri.load(std::memory_order_seq_cst);
+
+        if (sri != nullptr) {
+            variant.binds.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        return sri;
+    }
+
+    // Nothing published for these dims - is this an upscaler render resolution
+    // we should build a variant for? Derive the target dims from the viewport
+    // (a per-eye viewport into a sub-resolution double-wide implies a target
+    // twice its width).
+    if (m_allow_subres.load(std::memory_order_relaxed) && is_subres_scene_candidate(vw, vh)) {
+        const auto pw = m_match_width.load(std::memory_order_relaxed);
+        const auto ph = m_match_height.load(std::memory_order_relaxed);
+        const float sy = ph != 0 ? (float)vh / (float)ph : 0.0f;
+        const float sx_full = pw != 0 ? (float)vw / (float)pw : 0.0f;
+
+        if (std::fabs(sx_full - sy) <= 0.015f) {
+            request_subres_variant(vw, vh);
+        } else {
+            request_subres_variant(vw * 2, vh);
+        }
+    }
+
+    return nullptr;
 }
 
 ID3D12GraphicsCommandList5* VRSInjector::resolve_cl5(ID3D12GraphicsCommandList* command_list) {
@@ -190,28 +337,24 @@ void VRSInjector::on_om_set_render_targets(
 
     // Cheap relaxed peek so a disabled injector costs the detour only one load.
     // This path only ever binds, so there is nothing to do when inactive.
-    if (m_active_sri.load(std::memory_order_relaxed) == nullptr) {
+    if (!m_any_active.load(std::memory_order_relaxed)) {
         return;
     }
 
-    // Hold a recording ref across the load+use of m_active_sri so on_device_reset
-    // cannot free the texture out from under us. The seq-cst here pairs with the
-    // seq-cst store + drain in deactivate()/on_device_reset().
+    // Hold a recording ref across the load+use of the variant SRIs so
+    // on_device_reset cannot free a texture out from under us. The seq-cst here
+    // pairs with the seq-cst store + drain in deactivate()/on_device_reset().
     m_recording_refs.fetch_add(1, std::memory_order_seq_cst);
     utility::ScopeGuard rec_guard{[this]() {
         m_recording_refs.fetch_sub(1, std::memory_order_release);
     }};
 
-    const auto sri = m_active_sri.load(std::memory_order_seq_cst);
-
-    if (sri == nullptr) {
-        return; // raced with deactivation
-    }
-
     // Positive-only: only bind on a confirmed scene-target RTV match. Clearing
     // is owned by the viewport path, which is called after OMSetRenderTargets
     // and before the draws for every UE pass.
-    if (!matches_scene_target(num_render_targets, render_targets, depth_stencil)) {
+    const auto sri = match_rtv_bind(num_render_targets, render_targets, depth_stencil);
+
+    if (sri == nullptr) {
         return;
     }
 
@@ -238,7 +381,7 @@ void VRSInjector::on_rs_set_viewports(
 
     // Cheap relaxed peek: nothing published and no image of ours left on this
     // list means there is nothing to bind and nothing to clear.
-    if (m_active_sri.load(std::memory_order_relaxed) == nullptr && !holds_state) {
+    if (!m_any_active.load(std::memory_order_relaxed) && !holds_state) {
         return;
     }
 
@@ -246,8 +389,6 @@ void VRSInjector::on_rs_set_viewports(
     utility::ScopeGuard rec_guard{[this]() {
         m_recording_refs.fetch_sub(1, std::memory_order_release);
     }};
-
-    const auto sri = m_active_sri.load(std::memory_order_seq_cst);
 
     auto* cl5 = resolve_cl5(command_list);
 
@@ -257,54 +398,19 @@ void VRSInjector::on_rs_set_viewports(
 
     m_stat_rtv_binds.fetch_add(1, std::memory_order_relaxed);
 
-    if (sri != nullptr && viewport_matches_scene(viewports[0])) {
+    const auto sri = match_viewport_bind(viewports[0]);
+
+    if (sri != nullptr) {
         bind_sri(cl5, sri);
         g_tl_sri_bound_cl = command_list;
     } else if (g_tl_sri_bound_cl == command_list) {
-        // Not the scene viewport (or the injector just deactivated), and we
+        // Not a scene viewport (or the injector just deactivated), and we
         // previously bound the image on this list: take it back off so later
         // passes aren't coarse-shaded. Lists we never touched keep whatever
         // shading-rate state the game set.
         unbind_sri(cl5);
         g_tl_sri_bound_cl = nullptr;
     }
-}
-
-bool VRSInjector::viewport_matches_scene(const D3D12_VIEWPORT& vp) const {
-    const auto scene_w = m_match_width.load(std::memory_order_relaxed);
-    const auto scene_h = m_match_height.load(std::memory_order_relaxed);
-
-    if (scene_w == 0 || scene_h == 0) {
-        return false;
-    }
-
-    const uint32_t vw = (uint32_t)(vp.Width + 0.5f);
-    const uint32_t vh = (uint32_t)(vp.Height + 0.5f);
-
-    // Height must line up with the scene target; small offscreen passes (shadow
-    // maps, reflection captures, downsampled post) won't.
-    const uint32_t h_tol = 2 + scene_h / 200; // ~0.5% tolerance
-    if (vh + h_tol < scene_h || vh > scene_h + h_tol) {
-        return false;
-    }
-
-    const uint32_t w_tol = 2 + scene_w / 200;
-
-    // Full-frame draw (both eyes in a double-wide target, or a mono target).
-    if (vw + w_tol >= scene_w && vw <= scene_w + w_tol) {
-        return true;
-    }
-
-    // Single-eye viewport into a double-wide target (per-eye pass). The SRI is
-    // full-width and maps 1:1 to the bound RT regardless of the viewport.
-    if (m_double_wide.load(std::memory_order_relaxed)) {
-        const uint32_t half = scene_w / 2;
-        if (vw + w_tol >= half && vw <= half + w_tol) {
-            return true;
-        }
-    }
-
-    return false;
 }
 
 bool VRSInjector::query_caps(ID3D12Device* device) {
@@ -338,45 +444,85 @@ bool VRSInjector::query_caps(ID3D12Device* device) {
 }
 
 namespace {
-bool foveation_desc_equivalent(const VRSInjector::FoveationDesc& a, const VRSInjector::FoveationDesc& b) {
+// Pattern-relevant fields only: target dimensions are per-variant and tracked
+// separately, so they are deliberately absent here.
+bool pattern_equivalent(const VRSInjector::FoveationDesc& a, const VRSInjector::FoveationDesc& b) {
     constexpr float EPS = 0.0025f;
 
     return a.double_wide == b.double_wide &&
         a.allow_4x4 == b.allow_4x4 &&
-        a.scene_width == b.scene_width &&
-        a.scene_height == b.scene_height &&
+        a.lens_mask == b.lens_mask &&
         std::fabs(a.full_rate_cutoff - b.full_rate_cutoff) < EPS &&
         std::fabs(a.half_rate_cutoff - b.half_rate_cutoff) < EPS &&
         std::fabs(a.center_u[0] - b.center_u[0]) < EPS &&
         std::fabs(a.center_v[0] - b.center_v[0]) < EPS &&
         std::fabs(a.center_u[1] - b.center_u[1]) < EPS &&
-        std::fabs(a.center_v[1] - b.center_v[1]) < EPS;
+        std::fabs(a.center_v[1] - b.center_v[1]) < EPS &&
+        std::fabs(a.lens_u[0] - b.lens_u[0]) < EPS &&
+        std::fabs(a.lens_v[0] - b.lens_v[0]) < EPS &&
+        std::fabs(a.lens_u[1] - b.lens_u[1]) < EPS &&
+        std::fabs(a.lens_v[1] - b.lens_v[1]) < EPS &&
+        std::fabs(a.lens_rx - b.lens_rx) < EPS &&
+        std::fabs(a.lens_ry - b.lens_ry) < EPS;
 }
 } // namespace
+
+void VRSInjector::unpublish_variant(Variant& variant) {
+    variant.sri.store(nullptr, std::memory_order_seq_cst);
+    variant.pub_width.store(0, std::memory_order_relaxed);
+    variant.pub_height.store(0, std::memory_order_relaxed);
+}
 
 void VRSInjector::deactivate() {
     // seq-cst so it pairs with the seq-cst increment in the recording paths:
     // on_device_reset() can then drain m_recording_refs and know that any thread
     // still holding a non-null image has been counted.
-    m_active_sri.store(nullptr, std::memory_order_seq_cst);
+    for (auto& variant : m_variants) {
+        unpublish_variant(variant);
+    }
+
+    m_any_active.store(false, std::memory_order_seq_cst);
+    m_suppress_fullres.store(false, std::memory_order_relaxed);
+    m_suppress_countdown = 0;
     m_match_width.store(0, std::memory_order_relaxed);
     m_match_height.store(0, std::memory_order_relaxed);
+}
+
+void VRSInjector::retire(Microsoft::WRL::ComPtr<ID3D12Resource> resource) {
+    if (resource != nullptr) {
+        // Held for a handful of updates so any command list recorded against the
+        // old image has long been submitted and retired by the GPU.
+        m_retired.emplace_back(8u, std::move(resource));
+    }
 }
 
 void VRSInjector::update(const FoveationDesc& desc) {
     std::scoped_lock _{m_update_mtx};
 
+    for (auto it = m_retired.begin(); it != m_retired.end();) {
+        if (it->first == 0 || --it->first == 0) {
+            it = m_retired.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
     m_last_stats.rtv_binds = m_stat_rtv_binds.exchange(0, std::memory_order_relaxed);
     m_last_stats.vrs_binds = m_stat_vrs_binds.exchange(0, std::memory_order_relaxed);
     m_last_stats.sri_updates = m_sri_updates;
+    m_last_stats.subres_binds = 0;
+    m_last_stats.subres_width = 0;
+    m_last_stats.subres_height = 0;
+    m_last_stats.suppressing_fullres = false;
     m_last_stats.active = false;
 
     // Periodic bind-rate log so activity is visible without the ImGui panel.
     if (++m_update_log_counter >= 120) {
         m_update_log_counter = 0;
-        spdlog::info("[VRS] binds/window: candidates={} applied={} sri_updates={} scene={}x{} double_wide={}",
+        spdlog::info("[VRS] binds/window: candidates={} applied={} sri_updates={} scene={}x{} double_wide={} suppress_fullres={}",
             m_last_stats.rtv_binds, m_last_stats.vrs_binds, m_sri_updates,
-            desc.scene_width, desc.scene_height, desc.double_wide);
+            desc.scene_width, desc.scene_height, desc.double_wide,
+            m_suppress_countdown > 0);
     }
 
     const auto& hook = g_framework->get_d3d12_hook();
@@ -393,50 +539,182 @@ void VRSInjector::update(const FoveationDesc& desc) {
         return;
     }
 
-    const auto tile = m_caps.tile_size;
-    const uint32_t sri_w = (desc.scene_width + tile - 1) / tile;
-    const uint32_t sri_h = (desc.scene_height + tile - 1) / tile;
-
-    m_last_stats.sri_width = sri_w;
-    m_last_stats.sri_height = sri_h;
-
     // Publish the cheap hot-path parameters every frame.
     m_require_depth.store(desc.require_depth, std::memory_order_relaxed);
     m_excluded_resource.store(desc.ui_target, std::memory_order_relaxed);
     m_double_wide.store(desc.double_wide, std::memory_order_relaxed);
-
-    const bool needs_regen = !m_has_last_desc || !foveation_desc_equivalent(desc, m_last_desc) ||
-        m_active_sri.load(std::memory_order_relaxed) == nullptr;
-
-    if (needs_regen) {
-        if (!generate_and_upload(device, desc, sri_w, sri_h)) {
-            deactivate();
-            return;
-        }
-
-        m_last_desc = desc;
-        m_has_last_desc = true;
-    }
-
+    m_allow_subres.store(desc.allow_subres, std::memory_order_relaxed);
     m_match_width.store(desc.scene_width, std::memory_order_relaxed);
     m_match_height.store(desc.scene_height, std::memory_order_relaxed);
-    m_last_stats.active = m_active_sri.load(std::memory_order_relaxed) != nullptr;
+
+    if (!m_has_last_desc || !pattern_equivalent(desc, m_last_desc)) {
+        ++m_pattern_serial;
+    }
+
+    m_last_desc = desc;
+    m_has_last_desc = true;
+
+    // Variant 0 always serves the display-resolution scene target.
+    m_variants[0].target_width = desc.scene_width;
+    m_variants[0].target_height = desc.scene_height;
+
+    // Adopt a pending upscaler render-resolution request.
+    if (const auto req = m_subres_request.exchange(0, std::memory_order_relaxed); req != 0 && desc.allow_subres) {
+        const uint32_t req_w = (uint32_t)(req >> 32);
+        const uint32_t req_h = (uint32_t)(req & 0xffffffffull);
+
+        if (find_variant_for_target(req_w, req_h) < 0 && is_subres_scene_candidate(req_w, req_h)) {
+            Variant* slot = nullptr;
+
+            // Prefer re-targeting a nearby variant (dynamic-resolution drift),
+            // then a free slot, then the longest-idle one.
+            for (size_t i = 1; i < MAX_VARIANTS; ++i) {
+                auto& v = m_variants[i];
+
+                if (v.target_width != 0 &&
+                    std::fabs((float)v.target_width - (float)req_w) <= (float)req_w * 0.04f &&
+                    std::fabs((float)v.target_height - (float)req_h) <= (float)req_h * 0.04f) {
+                    slot = &v;
+                    break;
+                }
+            }
+
+            if (slot == nullptr) {
+                for (size_t i = 1; i < MAX_VARIANTS; ++i) {
+                    if (m_variants[i].target_width == 0) {
+                        slot = &m_variants[i];
+                        break;
+                    }
+                }
+            }
+
+            if (slot == nullptr) {
+                slot = &m_variants[1];
+
+                for (size_t i = 2; i < MAX_VARIANTS; ++i) {
+                    if (m_variants[i].idle_updates > slot->idle_updates) {
+                        slot = &m_variants[i];
+                    }
+                }
+
+                unpublish_variant(*slot);
+            }
+
+            if (slot->target_width != req_w || slot->target_height != req_h) {
+                spdlog::info("[VRS] Upscaler render resolution detected: {}x{} (display {}x{})",
+                    req_w, req_h, desc.scene_width, desc.scene_height);
+            }
+
+            slot->target_width = req_w;
+            slot->target_height = req_h;
+            slot->idle_updates = 0;
+        }
+    }
+
+    bool any_active = false;
+    uint32_t subres_binds = 0;
+
+    for (size_t i = 0; i < MAX_VARIANTS; ++i) {
+        auto& variant = m_variants[i];
+        const bool is_subres = i != 0;
+
+        if (variant.target_width == 0 || variant.target_height == 0) {
+            continue;
+        }
+
+        const auto binds_last = variant.binds.exchange(0, std::memory_order_relaxed);
+
+        if (is_subres) {
+            subres_binds += binds_last;
+
+            if (binds_last == 0) {
+                if (++variant.idle_updates > VARIANT_IDLE_UPDATES) {
+                    unpublish_variant(variant);
+                    variant.target_width = 0;
+                    variant.target_height = 0;
+                    variant.pattern_serial = 0;
+                    continue;
+                }
+            } else {
+                variant.idle_updates = 0;
+            }
+        }
+
+        const bool published = variant.sri.load(std::memory_order_relaxed) != nullptr &&
+            variant.pub_width.load(std::memory_order_relaxed) == variant.target_width &&
+            variant.pub_height.load(std::memory_order_relaxed) == variant.target_height;
+
+        if (!published || variant.pattern_serial != m_pattern_serial) {
+            if (generate_and_upload(device, desc, variant)) {
+                variant.pattern_serial = m_pattern_serial;
+            } else if (i == 0) {
+                deactivate();
+                return;
+            } else {
+                unpublish_variant(variant);
+                variant.target_width = 0;
+                variant.target_height = 0;
+                continue;
+            }
+        }
+
+        if (variant.sri.load(std::memory_order_relaxed) != nullptr) {
+            any_active = true;
+
+            if (is_subres && m_last_stats.subres_width == 0) {
+                m_last_stats.subres_width = variant.target_width;
+                m_last_stats.subres_height = variant.target_height;
+            }
+        }
+    }
+
+    // Suppress display-resolution binds while upscaler render-resolution scene
+    // activity is live (those binds are post-upscale passes), with a linger so
+    // per-frame pass ordering jitter doesn't flap the state.
+    if (subres_binds > 0) {
+        m_suppress_countdown = SUPPRESS_LINGER_UPDATES;
+    } else if (m_suppress_countdown > 0) {
+        --m_suppress_countdown;
+    }
+
+    m_suppress_fullres.store(m_suppress_countdown > 0, std::memory_order_relaxed);
+
+    m_any_active.store(any_active, std::memory_order_release);
+
+    const auto& v0_slot = m_variants[0].ring[(m_variants[0].ring_index + SRI_RING_SIZE - 1) % SRI_RING_SIZE];
+    m_last_stats.sri_width = v0_slot.width;
+    m_last_stats.sri_height = v0_slot.height;
+    m_last_stats.subres_binds = subres_binds;
+    m_last_stats.suppressing_fullres = m_suppress_countdown > 0;
+    m_last_stats.active = any_active;
 }
 
-bool VRSInjector::generate_and_upload(ID3D12Device* device, const FoveationDesc& desc, uint32_t sri_w, uint32_t sri_h) {
-    const size_t slot_index = m_sri_index;
-    m_sri_index = (m_sri_index + 1) % SRI_RING_SIZE;
+bool VRSInjector::generate_and_upload(ID3D12Device* device, const FoveationDesc& desc, Variant& variant) {
+    const uint32_t target_w = variant.target_width;
+    const uint32_t target_h = variant.target_height;
+    const bool is_subres = &variant != &m_variants[0];
 
-    auto& slot = m_sri_ring[slot_index];
-    auto& ctx = m_upload_ctx[slot_index];
+    const auto tile = m_caps.tile_size;
+    // Sub-resolution targets are sometimes viewport-derived, so their true
+    // texture extent may be a pixel or two larger; a margin tile keeps the SRI
+    // at least as large as the target's tile grid (required by the API). Tiles
+    // past the real edge simply never apply.
+    const uint32_t sri_w = (target_w + tile - 1) / tile + (is_subres ? 1 : 0);
+    const uint32_t sri_h = (target_h + tile - 1) / tile + (is_subres ? 1 : 0);
 
-    if (!m_upload_ctx_ready[slot_index]) {
+    const size_t slot_index = variant.ring_index;
+    variant.ring_index = (variant.ring_index + 1) % SRI_RING_SIZE;
+
+    auto& slot = variant.ring[slot_index];
+    auto& ctx = variant.upload_ctx[slot_index];
+
+    if (!variant.upload_ctx_ready[slot_index]) {
         if (!ctx.setup(L"VRSInjector upload context")) {
             spdlog::error("[VRS] Failed to set up upload command context");
             return false;
         }
 
-        m_upload_ctx_ready[slot_index] = true;
+        variant.upload_ctx_ready[slot_index] = true;
     }
 
     // This slot's own previous upload is SRI_RING_SIZE regenerations old, so the
@@ -448,6 +726,10 @@ bool VRSInjector::generate_and_upload(ID3D12Device* device, const FoveationDesc&
     const uint32_t row_pitch = (sri_w + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
 
     if (slot.texture == nullptr || slot.width != sri_w || slot.height != sri_h) {
+        // A command list recorded a few frames ago may still reference the old
+        // image; retire it instead of releasing it out from under the GPU.
+        retire(std::move(slot.texture));
+        retire(std::move(slot.upload));
         slot.texture.Reset();
         slot.upload.Reset();
         slot.in_shading_rate_state = false;
@@ -502,7 +784,8 @@ bool VRSInjector::generate_and_upload(ID3D12Device* device, const FoveationDesc&
     // Fill the upload buffer with the foveation pattern. Rates are literal
     // D3D12_SHADING_RATE palette values, matching UE's VRSShadingRateFoveated.usf:
     // concentric rings measured in squared distance normalized by the squared
-    // per-eye half-diagonal.
+    // per-eye half-diagonal. The pattern is generated in this variant's target
+    // pixel space, so upscaler render resolutions get correctly-scaled rings.
     {
         uint8_t* mapped{nullptr};
         const D3D12_RANGE no_read{0, 0};
@@ -513,21 +796,23 @@ bool VRSInjector::generate_and_upload(ID3D12Device* device, const FoveationDesc&
         }
 
         const uint32_t num_eyes = desc.double_wide ? 2 : 1;
-        const float tile = (float)m_caps.tile_size;
-        const float eye_w_px = (float)desc.scene_width / (float)num_eyes;
-        const float h_px = (float)desc.scene_height;
+        const float tile_f = (float)tile;
+        const float eye_w_px = (float)target_w / (float)num_eyes;
+        const float h_px = (float)target_h;
         const float half_diag_sq = (eye_w_px * 0.5f) * (eye_w_px * 0.5f) + (h_px * 0.5f) * (h_px * 0.5f);
         const float full_cutoff_sq = desc.full_rate_cutoff * desc.full_rate_cutoff;
         const float half_cutoff_sq = desc.half_rate_cutoff * desc.half_rate_cutoff;
         const uint8_t outer_rate = (desc.allow_4x4 && m_caps.additional_rates)
             ? (uint8_t)D3D12_SHADING_RATE_4X4 : (uint8_t)D3D12_SHADING_RATE_2X2;
 
+        const bool lens = desc.lens_mask && desc.lens_rx > 0.01f && desc.lens_ry > 0.01f;
+
         for (uint32_t ty = 0; ty < sri_h; ++ty) {
             uint8_t* row = mapped + (size_t)ty * row_pitch;
-            const float py = ((float)ty + 0.5f) * tile;
+            const float py = ((float)ty + 0.5f) * tile_f;
 
             for (uint32_t tx = 0; tx < sri_w; ++tx) {
-                const float px = ((float)tx + 0.5f) * tile;
+                const float px = ((float)tx + 0.5f) * tile_f;
                 const uint32_t eye = (num_eyes == 2 && px >= eye_w_px) ? 1 : 0;
                 const float cx = (float)eye * eye_w_px + desc.center_u[eye] * eye_w_px;
                 const float cy = desc.center_v[eye] * h_px;
@@ -541,6 +826,20 @@ bool VRSInjector::generate_and_upload(ID3D12Device* device, const FoveationDesc&
                     rate = outer_rate;
                 } else if (d2 > full_cutoff_sq) {
                     rate = (uint8_t)D3D12_SHADING_RATE_2X2;
+                }
+
+                // Lens mask: outside the lens-visible ellipse (anchored at the
+                // optical center, not the gaze), drop straight to the coarsest
+                // ring rate - the lens cannot resolve these pixels anyway.
+                if (lens && rate != outer_rate) {
+                    const float lcx = (float)eye * eye_w_px + desc.lens_u[eye] * eye_w_px;
+                    const float lcy = desc.lens_v[eye] * h_px;
+                    const float ldx = (px - lcx) / (desc.lens_rx * eye_w_px * 0.5f);
+                    const float ldy = (py - lcy) / (desc.lens_ry * h_px * 0.5f);
+
+                    if (ldx * ldx + ldy * ldy > 1.0f) {
+                        rate = outer_rate;
+                    }
                 }
 
                 row[tx] = rate;
@@ -603,7 +902,9 @@ bool VRSInjector::generate_and_upload(ID3D12Device* device, const FoveationDesc&
 
     // Publish. Command lists recorded from now on use the new image; ones in
     // flight keep referencing an older ring slot, which stays alive.
-    m_active_sri.store(slot.texture.Get(), std::memory_order_release);
+    variant.pub_width.store(target_w, std::memory_order_relaxed);
+    variant.pub_height.store(target_h, std::memory_order_relaxed);
+    variant.sri.store(slot.texture.Get(), std::memory_order_release);
 
     return true;
 }
@@ -618,11 +919,11 @@ void VRSInjector::on_device_reset() {
 
     deactivate();
 
-    // deactivate() published m_active_sri = nullptr (seq-cst). Wait for any
-    // recording thread that already loaded the old pointer to finish using it
-    // before releasing the textures, so RSSetShadingRateImage can never run on a
-    // freed resource. The seq-cst handshake guarantees a thread still holding a
-    // non-null image is observed here as a live ref.
+    // deactivate() published null SRIs (seq-cst). Wait for any recording thread
+    // that already loaded an old pointer to finish using it before releasing the
+    // textures, so RSSetShadingRateImage can never run on a freed resource. The
+    // seq-cst handshake guarantees a thread still holding a non-null image is
+    // observed here as a live ref.
     for (uint32_t spins = 0; m_recording_refs.load(std::memory_order_seq_cst) != 0; ++spins) {
         if (spins >= 2000000u) {
             spdlog::warn("[VRS] on_device_reset: recording refs did not drain, proceeding");
@@ -637,19 +938,30 @@ void VRSInjector::on_device_reset() {
         m_rtv_map.clear();
     }
 
-    for (auto& slot : m_sri_ring) {
-        slot.texture.Reset();
-        slot.upload.Reset();
-        slot.width = 0;
-        slot.height = 0;
-        slot.in_shading_rate_state = false;
+    for (auto& variant : m_variants) {
+        for (auto& slot : variant.ring) {
+            slot.texture.Reset();
+            slot.upload.Reset();
+            slot.width = 0;
+            slot.height = 0;
+            slot.in_shading_rate_state = false;
+        }
+
+        for (size_t i = 0; i < SRI_RING_SIZE; ++i) {
+            variant.upload_ctx[i].reset();
+            variant.upload_ctx_ready[i] = false;
+        }
+
+        variant.target_width = 0;
+        variant.target_height = 0;
+        variant.idle_updates = 0;
+        variant.pattern_serial = 0;
+        variant.ring_index = 0;
+        variant.binds.store(0, std::memory_order_relaxed);
     }
 
-    for (size_t i = 0; i < SRI_RING_SIZE; ++i) {
-        m_upload_ctx[i].reset();
-        m_upload_ctx_ready[i] = false;
-    }
-
+    m_retired.clear();
+    m_subres_request.store(0, std::memory_order_relaxed);
     m_caps = Caps{};
     m_caps_device = nullptr;
     m_has_last_desc = false;

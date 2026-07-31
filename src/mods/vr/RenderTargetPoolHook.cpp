@@ -79,16 +79,26 @@ void RenderTargetPoolHook::on_post_find_free_element(
     if (name != nullptr) {
         //SPDLOG_INFO("FRenderTargetPool::FindFreeElement called with name {}", utility::narrow(name));
 
+        // Heterogeneous lookups keyed on the raw pointer: steady-state this
+        // allocates nothing (a wstring is only built the first time a name is
+        // seen). This path runs for every pooled render target on the render
+        // thread, dozens+ times per frame.
+        const std::wstring_view name_view{name};
+
         std::scoped_lock _{g_hook->m_mutex};
 
         if (out != nullptr) {
-            g_hook->m_render_targets[name] = out->reference;
-        } else {
-            g_hook->m_render_targets.erase(name);
+            if (auto it = g_hook->m_render_targets.find(name_view); it != g_hook->m_render_targets.end()) {
+                it->second = out->reference;
+            } else {
+                g_hook->m_render_targets.emplace(std::wstring{name_view}, out->reference);
+            }
+        } else if (auto it = g_hook->m_render_targets.find(name_view); it != g_hook->m_render_targets.end()) {
+            g_hook->m_render_targets.erase(it);
         }
 
-        if (!g_hook->m_seen_names.contains(name)) {
-            g_hook->m_seen_names.insert(name);
+        if (g_hook->m_seen_names.find(name_view) == g_hook->m_seen_names.end()) {
+            g_hook->m_seen_names.emplace(name_view);
             SPDLOG_INFO("FRenderTargetPool::FindFreeElement called with name {}", utility::narrow(name));
         }
     }

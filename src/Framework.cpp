@@ -637,6 +637,22 @@ void Framework::on_frame_d3d12() {
         return;
     }
 
+    // Skip the whole overlay render pass (clear + two draw submissions + barriers)
+    // when ImGui produced no geometry this frame and no plugin draws into the
+    // framework RT. The FRAMEWORK_UI swapchain copy is already gated on
+    // is_drawing_anything(), and the next frame with content clears first, so
+    // stale RT contents can never be composited.
+    const auto pre_draw_data = ImGui::GetDrawData();
+    const bool overlay_has_content = pre_draw_data != nullptr &&
+        (pre_draw_data->TotalVtxCount > 0 || PluginLoader::get()->has_dx12_render_callbacks());
+
+    if (!overlay_has_content) {
+        if (is_init_ok) {
+            m_mods->on_post_frame();
+        }
+        return;
+    }
+
     cmd_ctx->wait(INFINITE);
     if (auto draw_data = ImGui::GetDrawData(); draw_data != nullptr) {
         std::scoped_lock _{ cmd_ctx->mtx };

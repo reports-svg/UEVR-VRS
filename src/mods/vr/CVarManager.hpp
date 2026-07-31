@@ -124,6 +124,12 @@ public:
 
         bool m_frozen{false};
         bool m_ever_frozen{false};
+
+        // Backoff for cvars a game simply doesn't have: retry the (potentially
+        // non-miss-caching) lookup on a coarse tick cadence instead of every
+        // engine tick forever.
+        uint16_t m_find_backoff{0};
+        static constexpr uint16_t FIND_RETRY_INTERVAL = 90;
     };
 
     class CVarStandard : public CVar {

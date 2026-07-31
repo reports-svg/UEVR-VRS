@@ -195,4 +195,12 @@ struct VRRuntime {
     // want to retain the final eye texture resolution
     float eye_width_adjustment{1};
     float eye_height_adjustment{1};
+
+    // Per-eye tangents actually displayed after the FOV-scale sliders are
+    // applied ([left, right, up, down], same convention as raw_projections).
+    // When a scale < 1 is active these are declared to the runtime at submit in
+    // place of the raw per-frame FOV, so the compositor shows the narrowed
+    // frustum at its correct angular size.
+    float display_projections[2][4]{};
+    bool fov_scale_active{false};
 };

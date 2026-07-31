@@ -149,6 +149,14 @@ public:
 
     bool hook_ufunction_ptr(UEVR_UFunctionHandle func, UEVR_UFunction_NativePreFn pre, UEVR_UFunction_NativePostFn post);
 
+    // Whether any plugin (or Lua script) registered a DX12 framework-render
+    // callback. Lets the framework skip the overlay render pass entirely when
+    // ImGui has nothing to draw and no plugin would draw either.
+    bool has_dx12_render_callbacks() {
+        std::shared_lock _{m_api_cb_mtx};
+        return !m_on_post_render_vr_framework_dx12_cbs.empty();
+    }
+
 private:
     std::shared_mutex m_api_cb_mtx;
     std::vector<UEVR_OnPresentCb> m_on_present_cbs{};
