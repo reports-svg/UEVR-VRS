@@ -74,6 +74,7 @@ FoveatedRendering::FoveatedRendering() {
         *m_full_rate_cutoff,
         *m_half_rate_cutoff,
         *m_allow_4x4,
+        *m_gradient,
         *m_dynamic,
         *m_dynamic_target_ms,
         *m_gaze_tracking,
@@ -518,6 +519,7 @@ void FoveatedRendering::update_injected_path() {
     desc.full_rate_cutoff = full_cutoff;
     desc.half_rate_cutoff = half_cutoff;
     desc.allow_4x4 = m_allow_4x4->value();
+    desc.gradient = m_gradient->value();
     desc.require_depth = m_require_depth->value();
     desc.allow_subres = m_upscaler_compat->value();
 
@@ -557,6 +559,7 @@ void FoveatedRendering::update_injected_path() {
     m_preview.valid = true;
     m_preview.double_wide = desc.double_wide;
     m_preview.allow_4x4 = desc.allow_4x4;
+    m_preview.gradient = desc.gradient;
     m_preview.full_cutoff_sq = full_cutoff * full_cutoff;
     m_preview.half_cutoff_sq = half_cutoff * half_cutoff;
     {
@@ -603,7 +606,8 @@ int FoveatedRendering::preview_rate_at(float u, float v) const {
     const float r2 = r * r;
     const float d2 = 4.0f * (du * du * r2 + dv * dv) / (r2 + 1.0f);
 
-    const int outer = p.allow_4x4 ? 2 : 1;
+    // Classes: 0 = 1x1, 1 = 2x1 band, 2 = 2x2, 3 = 4x2/4x4.
+    const int outer = p.allow_4x4 ? 3 : 2;
 
     if (d2 > p.half_cutoff_sq) {
         return outer;
@@ -621,7 +625,12 @@ int FoveatedRendering::preview_rate_at(float u, float v) const {
     }
 
     if (d2 > p.full_cutoff_sq) {
-        return 1;
+        if (p.gradient) {
+            const float mid_sq = p.full_cutoff_sq + 0.4f * (p.half_cutoff_sq - p.full_cutoff_sq);
+            return d2 <= mid_sq ? 1 : 2;
+        }
+
+        return 2;
     }
     return 0;
 }
@@ -632,11 +641,12 @@ void FoveatedRendering::draw_debug_preview() {
         return;
     }
 
-    // UE-style rate colors: green = full 1x1, yellow = 2x2, red = coarsest.
+    // UE-style rate colors: green = full 1x1, lime = 2x1, yellow = 2x2, red = coarsest.
     const ImU32 col_1x1 = IM_COL32(40, 200, 60, 255);
+    const ImU32 col_2x1 = IM_COL32(150, 210, 45, 255);
     const ImU32 col_2x2 = IM_COL32(230, 205, 40, 255);
     const ImU32 col_4x4 = IM_COL32(225, 55, 45, 255);
-    const ImU32 rate_cols[3]{col_1x1, col_2x2, col_4x4};
+    const ImU32 rate_cols[4]{col_1x1, col_2x1, col_2x2, col_4x4};
 
     const int num_eyes = m_preview.double_wide ? 2 : 1;
     const float full_aspect = m_preview.eye_aspect * (float)num_eyes; // width/height
@@ -694,11 +704,15 @@ void FoveatedRendering::draw_debug_preview() {
         ImGui::TextUnformatted(label);
     };
     swatch(col_1x1, "1x1 (full)");
+    if (m_preview.gradient) {
+        ImGui::SameLine();
+        swatch(col_2x1, "2x1");
+    }
     ImGui::SameLine();
     swatch(col_2x2, "2x2");
     if (m_preview.allow_4x4) {
         ImGui::SameLine();
-        swatch(col_4x4, "4x4");
+        swatch(col_4x4, m_preview.gradient ? "4x2/4x4" : "4x4");
     }
 }
 
@@ -771,6 +785,11 @@ void FoveatedRendering::on_draw_ui() {
                 "Lets the far periphery use the coarsest 4x4 rate (one shaded pixel per 16), for the biggest "
                 "GPU saving at the cost of visible peripheral blockiness. Off caps the periphery at 2x2. "
                 "Requires a GPU that supports the additional shading rates.");
+            m_gradient->draw("Gradient Rings (Soft Transitions)");
+            help_marker(
+                "Inserts intermediate rates between the rings (1x1 -> 2x1 -> 2x2 -> 4x2 -> 4x4) so the "
+                "quality falloff is a soft ramp instead of a visible hard edge. Costs a small part of the "
+                "saving; recommended on.");
         }
 
         m_dynamic->draw("Dynamic (performance-based)");

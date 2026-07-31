@@ -191,10 +191,7 @@ ID3D12Resource* VRSInjector::match_rtv_bind(
     return nullptr;
 }
 
-ID3D12Resource* VRSInjector::match_viewport_bind(const D3D12_VIEWPORT& vp) {
-    const uint32_t vw = (uint32_t)(vp.Width + 0.5f);
-    const uint32_t vh = (uint32_t)(vp.Height + 0.5f);
-
+ID3D12Resource* VRSInjector::match_viewport_dims(uint32_t vw, uint32_t vh) {
     if (vw == 0 || vh == 0) {
         return nullptr;
     }
@@ -321,6 +318,21 @@ namespace {
 // D3D12 VRS state - and lets us take the image back off if the injector
 // deactivates mid-recording.
 thread_local ID3D12GraphicsCommandList* g_tl_sri_bound_cl = nullptr;
+
+// Depth state of the last OMSetRenderTargets on this thread's current list.
+// Geometry passes (base pass, translucency) bind a depth target; screen-space
+// lighting/reflection/post passes don't - and coarse-shading THOSE is what
+// turns subtle 2x2 foveation into crawling shimmer, because they resample the
+// coarse buffers with per-frame jitter. Epic's own VRS restricts itself to
+// depth-bound passes for the same reason.
+thread_local ID3D12GraphicsCommandList* g_tl_om_cl = nullptr;
+thread_local bool g_tl_om_has_depth = false;
+
+// A scene-matching viewport seen before its pass's render targets were bound
+// (packed (w<<32)|h, 0 = none) - lets the OM detour complete the bind once the
+// depth state is known, whichever order the game sets viewport and targets in.
+thread_local ID3D12GraphicsCommandList* g_tl_vp_cl = nullptr;
+thread_local uint64_t g_tl_vp_dims = 0;
 } // namespace
 
 void VRSInjector::on_om_set_render_targets(
@@ -336,8 +348,13 @@ void VRSInjector::on_om_set_render_targets(
         return;
     }
 
+    // Track this list's depth state unconditionally (two TL stores) so the
+    // viewport path can gate on it even if the injector activates mid-frame.
+    const bool has_depth = depth_stencil != nullptr && depth_stencil->ptr != 0;
+    g_tl_om_cl = command_list;
+    g_tl_om_has_depth = has_depth;
+
     // Cheap relaxed peek so a disabled injector costs the detour only one load.
-    // This path only ever binds, so there is nothing to do when inactive.
     if (!m_any_active.load(std::memory_order_relaxed)) {
         return;
     }
@@ -350,23 +367,36 @@ void VRSInjector::on_om_set_render_targets(
         m_recording_refs.fetch_sub(1, std::memory_order_release);
     }};
 
-    // Positive-only: only bind on a confirmed scene-target RTV match. Clearing
-    // is owned by the viewport path, which is called after OMSetRenderTargets
-    // and before the draws for every UE pass.
-    const auto sri = match_rtv_bind(num_render_targets, render_targets, depth_stencil);
+    // Positive path 1: a confirmed scene-target RTV match.
+    auto sri = match_rtv_bind(num_render_targets, render_targets, depth_stencil);
 
-    if (sri == nullptr) {
+    // Positive path 2: this pass's viewport already matched a variant but the
+    // depth gate couldn't be evaluated yet (viewport was set before targets).
+    if (sri == nullptr && has_depth && g_tl_vp_cl == command_list && g_tl_vp_dims != 0 &&
+        m_require_depth.load(std::memory_order_relaxed)) {
+        sri = match_viewport_dims((uint32_t)(g_tl_vp_dims >> 32), (uint32_t)g_tl_vp_dims);
+    }
+
+    if (sri != nullptr) {
+        auto* cl5 = resolve_cl5(command_list);
+
+        if (cl5 != nullptr) {
+            bind_sri(cl5, sri);
+            g_tl_sri_bound_cl = command_list;
+        }
+
         return;
     }
 
-    auto* cl5 = resolve_cl5(command_list);
-
-    if (cl5 == nullptr) {
-        return;
+    // A pass without depth started while our image was still bound on this
+    // list: take it off so screen-space/post draws are never coarse-shaded.
+    if (!has_depth && g_tl_sri_bound_cl == command_list &&
+        m_require_depth.load(std::memory_order_relaxed)) {
+        if (auto* cl5 = resolve_cl5(command_list); cl5 != nullptr) {
+            unbind_sri(cl5);
+            g_tl_sri_bound_cl = nullptr;
+        }
     }
-
-    bind_sri(cl5, sri);
-    g_tl_sri_bound_cl = command_list;
 }
 
 void VRSInjector::on_rs_set_viewports(
@@ -399,16 +429,28 @@ void VRSInjector::on_rs_set_viewports(
 
     m_stat_rtv_binds.fetch_add(1, std::memory_order_relaxed);
 
-    const auto sri = match_viewport_bind(viewports[0]);
+    const uint32_t vw = (uint32_t)(viewports[0].Width + 0.5f);
+    const uint32_t vh = (uint32_t)(viewports[0].Height + 0.5f);
+    const auto sri = match_viewport_dims(vw, vh);
 
-    if (sri != nullptr) {
+    // Depth gate: only shade geometry passes coarsely. If the render targets
+    // for this pass haven't been bound yet, stash the viewport so the OM
+    // detour can complete the bind once the depth state is known.
+    const bool require_depth = m_require_depth.load(std::memory_order_relaxed);
+    const bool depth_known_ok = !require_depth || (g_tl_om_cl == command_list && g_tl_om_has_depth);
+
+    g_tl_vp_cl = command_list;
+    g_tl_vp_dims = (sri != nullptr) ? (((uint64_t)vw << 32) | (uint64_t)vh) : 0;
+
+    if (sri != nullptr && depth_known_ok) {
         bind_sri(cl5, sri);
         g_tl_sri_bound_cl = command_list;
     } else if (g_tl_sri_bound_cl == command_list) {
-        // Not a scene viewport (or the injector just deactivated), and we
+        // Not a scene viewport, or the depth gate isn't satisfied (yet), and we
         // previously bound the image on this list: take it back off so later
-        // passes aren't coarse-shaded. Lists we never touched keep whatever
-        // shading-rate state the game set.
+        // passes aren't coarse-shaded. If depth targets arrive for this pass,
+        // the OM detour re-binds from the stashed viewport. Lists we never
+        // touched keep whatever shading-rate state the game set.
         unbind_sri(cl5);
         g_tl_sri_bound_cl = nullptr;
     }
@@ -452,6 +494,7 @@ bool pattern_equivalent(const VRSInjector::FoveationDesc& a, const VRSInjector::
 
     return a.double_wide == b.double_wide &&
         a.allow_4x4 == b.allow_4x4 &&
+        a.gradient == b.gradient &&
         a.lens_mask == b.lens_mask &&
         std::fabs(a.full_rate_cutoff - b.full_rate_cutoff) < EPS &&
         std::fabs(a.half_rate_cutoff - b.half_rate_cutoff) < EPS &&
@@ -816,6 +859,12 @@ bool VRSInjector::generate_and_upload(ID3D12Device* device, const FoveationDesc&
         const uint8_t outer_rate = (desc.allow_4x4 && m_caps.additional_rates)
             ? (uint8_t)D3D12_SHADING_RATE_4X4 : (uint8_t)D3D12_SHADING_RATE_2X2;
 
+        // Gradient: carve intermediate bands (1x1 -> 2x1 -> 2x2 -> 4x2 -> 4x4)
+        // so the rate transitions are soft ramps instead of one hard edge.
+        const bool gradient = desc.gradient;
+        const float mid_cutoff_sq = full_cutoff_sq + 0.4f * (half_cutoff_sq - full_cutoff_sq);
+        const float outer_mid_sq = half_cutoff_sq + 0.35f * (1.0f - half_cutoff_sq);
+
         const bool lens = desc.lens_mask && desc.lens_rx > 0.01f && desc.lens_ry > 0.01f;
 
         for (uint32_t ty = 0; ty < sri_h; ++ty) {
@@ -834,9 +883,17 @@ bool VRSInjector::generate_and_upload(ID3D12Device* device, const FoveationDesc&
                 uint8_t rate = (uint8_t)D3D12_SHADING_RATE_1X1;
 
                 if (d2 > half_cutoff_sq) {
-                    rate = outer_rate;
+                    if (gradient && outer_rate == (uint8_t)D3D12_SHADING_RATE_4X4 && d2 <= outer_mid_sq) {
+                        rate = (uint8_t)D3D12_SHADING_RATE_4X2;
+                    } else {
+                        rate = outer_rate;
+                    }
                 } else if (d2 > full_cutoff_sq) {
-                    rate = (uint8_t)D3D12_SHADING_RATE_2X2;
+                    if (gradient && d2 <= mid_cutoff_sq) {
+                        rate = (uint8_t)D3D12_SHADING_RATE_2X1;
+                    } else {
+                        rate = (uint8_t)D3D12_SHADING_RATE_2X2;
+                    }
                 }
 
                 // Lens mask: outside the lens-visible ellipse (anchored at the

@@ -106,8 +106,8 @@ private:
     // injector is actually generating (green=1x1, yellow=2x2, red=4x4), the
     // injected-path analog of the engine's r.VRS.Preview overlay.
     void draw_debug_preview();
-    // Rate class (0=1x1, 1=2x2, 2=4x4) at a full-frame normalized position,
-    // using the last pattern published to the injector.
+    // Rate class (0=1x1, 1=2x1, 2=2x2, 3=4x2/4x4) at a full-frame normalized
+    // position, using the last pattern published to the injector.
     int preview_rate_at(float u, float v) const;
 
     const ModCombo::Ptr m_mode{ ModCombo::create(generate_name("Mode"),
@@ -120,6 +120,9 @@ private:
     const ModSlider::Ptr m_full_rate_cutoff{ ModSlider::create(generate_name("FullRateCutoff"), 0.0f, 1.0f, 0.5f) };
     const ModSlider::Ptr m_half_rate_cutoff{ ModSlider::create(generate_name("HalfRateCutoff"), 0.0f, 1.5f, 0.75f) };
     const ModToggle::Ptr m_allow_4x4{ ModToggle::create(generate_name("Allow4x4"), true) };
+    // Soft ramp between rate rings (1x1 -> 2x1 -> 2x2 -> 4x2 -> 4x4) instead of
+    // hard edges; costs a sliver of the saving, hides the transitions.
+    const ModToggle::Ptr m_gradient{ ModToggle::create(generate_name("GradientRings"), true) };
     const ModToggle::Ptr m_dynamic{ ModToggle::create(generate_name("Dynamic"), false) };
     const ModSlider::Ptr m_dynamic_target_ms{ ModSlider::create(generate_name("DynamicTargetMs"), 5.0f, 30.0f, 12.5f) };
     const ModToggle::Ptr m_gaze_tracking{ ModToggle::create(generate_name("GazeTracking"), false) };
@@ -158,6 +161,7 @@ private:
         bool valid{false};
         bool double_wide{true};
         bool allow_4x4{true};
+        bool gradient{true};
         float full_cutoff_sq{0.25f};
         float half_cutoff_sq{0.5625f};
         float eye_aspect{1.0f}; // per-eye width/height, for correct ring shape

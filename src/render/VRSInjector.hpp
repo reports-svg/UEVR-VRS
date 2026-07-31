@@ -51,6 +51,7 @@ public:
         bool require_depth{true};   // only apply when a DSV is bound (geometry passes)
         bool double_wide{true};     // scene target holds both eyes side-by-side
         bool allow_4x4{true};
+        bool gradient{true};        // intermediate 2x1/4x2 bands for soft transitions
         bool allow_subres{true};    // build variants for upscaler render resolutions
         uint32_t scene_width{};
         uint32_t scene_height{};
@@ -204,8 +205,8 @@ private:
         const D3D12_CPU_DESCRIPTOR_HANDLE* render_targets,
         const D3D12_CPU_DESCRIPTOR_HANDLE* depth_stencil);
 
-    // Viewport-dimension matching; fills the SRI to bind (nullptr = no match).
-    ID3D12Resource* match_viewport_bind(const D3D12_VIEWPORT& vp);
+    // Viewport-dimension matching; returns the SRI to bind (nullptr = no match).
+    ID3D12Resource* match_viewport_dims(uint32_t vw, uint32_t vh);
 
     // Hot-path published state (recording threads only read these).
     std::array<Variant, MAX_VARIANTS> m_variants{};
